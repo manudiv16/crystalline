@@ -1,105 +1,104 @@
-# ADR-001: Embedded Sacrum en Gleam con libsql/Turso
+# ADR-001: Embedded Sacrum in Gleam with libsql/Turso
 
 ## Status
 Proposed
 
 ## Context
 
-Sacrum actual es un servidor Elixir/Phoenix con PostgreSQL, GraphQL API y Phoenix Channels.
-Vertebrae (Rust) actúa como cliente con CLI, GUI Tauri y daemon.
+Current Sacrum is an Elixir/Phoenix server with PostgreSQL, GraphQL API, and Phoenix Channels.
+Vertebrae (Rust) acts as the client with CLI, Tauri GUI, and daemon.
 
-**Problema:** La arquitectura requiere un servidor remoto siempre disponible. Para uso
-embedded/local-first con migración posterior a Turso (acceso remoto), necesitamos un
-backend autocontenido.
+**Problem:** The architecture requires a separate remote server. For embedded/local-first use
+with later migration to Turso (remote access), we need a self-contained backend.
 
-**Requerimientos del usuario:**
-- Tauri + Gleam (no Rust backend + React frontend)
-- Backend embedded en Gleam
-- libsql local → Turso remoto (misma API)
-- Flujos de control de agentes moldeables y reusables
-- Distintos tipos de flujo: con loops, sin loops, con inputs humanos entre pasos
-- Al asignar una tarea a un agente, poder elegir qué tipo de flujo usar
-- Emular la funcionalidad de Sacrum (workflow engine, task management, execution tracking)
+**User requirements:**
+- Tauri + Gleam (not Rust backend + React frontend)
+- Embedded backend in Gleam
+- libsql local → Turso remote (same code, no changes)
+- Moldable, reusable agent control flows
+- Different flow types: with loops, without loops, with human inputs between steps
+- When assigning a task to an agent, be able to choose which flow type to use
+- Emulate Sacrum functionality (workflow engine, task management, execution tracking)
 
 ## Decision
 
 ### Stack
-| Capa | Tecnología | Rationale |
+| Layer | Technology | Rationale |
 |---|---|---|
-| Backend | **Gleam** (BEAM) | Tipado estático, concurrencia OTP, interoperabilidad Erlang |
-| HTTP Server | **Mist** | Servidor HTTP nativo para Gleam |
-| Web Framework | **Wisp** | Framework web práctico para Gleam |
-| Database | **libsql_gleam** (NIF Rust) | SQLite local → Turso remoto sin cambiar código |
-| Frontend GUI | **Tauri** (TBD) | Shell nativo, WebView para UI |
-| Frontend Web | **Lustre** (TBD) | Framework UI en Gleam si se necesita SPA |
+| Backend | **Gleam** (BEAM) | Static typing, OTP concurrency, Erlang interop |
+| HTTP Server | **Mist** | Native Gleam HTTP server |
+| Web Framework | **Wisp** | Practical Gleam web framework |
+| Database | **libsql_gleam** (Rust NIF) | Local SQLite → remote Turso without code changes |
+| GUI Shell | **Tauri** (TBD) | Native shell, WebView for UI |
+| Frontend Web | **Lustre** (TBD) | Gleam UI framework if SPA needed |
 
-### Arquitectura de Flujos Moldeables
+### Moldable Flow Architecture
 
-Los flujos se modelan como **grafos dirigidos de nodos composables**:
-
-```
-FlowTemplate (definición reutilizable)
-  └── Node (tipo determina comportamiento)
-        ├── Step          → Ejecuta agente con prompt/config
-        ├── Sequence      → Ejecuta hijos en orden
-        ├── Branch        → Evalúa condiciones, elige target
-        ├── Loop          → Repite hijos hasta condición de salida
-        ├── Parallel      → Ejecuta hijos concurrentemente
-        └── HumanInput    → Pausa, espera input externo
-  └── Transition (con condición opcional)
-```
-
-**Mecanismo de ejecución:**
-1. `FlowTemplate` se valida (DAG, refs, ciclos)
-2. Se instancia como `FlowInstance` vinculada a un `Task`
-3. `ExecutionState` sigue el grafo nodo a nodo
-4. Cada `advance()` devuelve `(nuevo_estado, acción_a_ejecutar)`
-5. El caller ejecuta la acción (agent prompt, input humano, etc.) y reporta resultado
-
-**Patrones predefinidos:**
-- `build_linear_flow()`: paso1 → paso2 → paso3
-- `build_loop_flow()`: pre → loop(condición) → post
-- `build_branch_flow()`: paso → branch(condiciones) → ramificaciones
-
-### Persistencia
+Flows are modeled as **directed graphs of composable nodes**:
 
 ```
-Local:    libsql file:sacrum.db (mismo proceso)
-Remoto:   libsql libsql://db.turso.io (sin cambiar código)
+FlowTemplate (reusable definition)
+  └── Node (type determines behavior)
+        ├── Step          → Execute agent with prompt/config
+        ├── Sequence      → Execute children in order
+        ├── Branch        → Evaluate conditions, pick target
+        ├── Loop          → Repeat children until exit condition
+        ├── Parallel      → Execute children concurrently
+        └── HumanInput    → Pause, wait for external input
+  └── Transition (with optional condition)
 ```
 
-Migraciones SQL embebidas en el binario para despliegue sin filesystem.
+**Execution mechanism:**
+1. `FlowTemplate` is validated (DAG, refs, cycles)
+2. Instantiated as `FlowInstance` bound to a `Task`
+3. `ExecutionState` traverses the graph node by node
+4. Each `advance()` returns `(new_state, action_to_execute)`
+5. Caller executes the action (agent prompt, human input, etc.) and reports result
+
+**Prebuilt patterns:**
+- `build_linear_flow()`: step1 → step2 → step3
+- `build_loop_flow()`: pre → loop(condition) → post
+- `build_branch_flow()`: step → branch(conditions) → branches
+
+### Persistence
+
+```
+Local:    libsql file:sacrum.db (same process)
+Remote:   libsql libsql://db.turso.io (no code changes)
+```
+
+SQL migrations embedded in the binary for filesystem-free deployment.
 
 ## Consequences
 
-### Positivas
-- **Zero-config local**: un binario con DB embebida
-- **Migración transparente**: mismo código para local y remoto
-- **Flujos reusables**: las plantillas de flujo son composables
-- **Tipado fuerte**: Gleam detecta errores en compilación
-- **Concurrencia OTP**: el executor es puramente funcional, fácil de paralelizar
+### Positive
+- **Zero-config local**: single binary with embedded DB
+- **Transparent migration**: same code for local and remote
+- **Reusable flows**: flow templates are composable
+- **Strong typing**: Gleam catches errors at compile time
+- **OTP concurrency**: executor is purely functional, easy to parallelize
 
-### Negativas
-- **Ecosistema joven**: menos librerías que Rust/Elixir
-- **libsql_gleam**: NIF no oficial, depende de mantenimiento externo
-- **JSON**: sin biblioteca madura (gleam_json incompatible con stdlib v1)
-- **Curva aprendizaje**: Gleam es menos conocido que Rust/Elixir
+### Negative
+- **Young ecosystem**: fewer libraries than Rust/Elixir
+- **libsql_gleam**: unofficial NIF, depends on external maintenance
+- **JSON**: no mature library (gleam_json incompatible with stdlib v1)
+- **Learning curve**: Gleam is less known than Rust/Elixir
 
-### Riesgos mitigables
-- JSON manual → usar `gleam_experimental` o wrapper propio
-- libsql_gleam → mantener capa de abstracción para swap si necesario
-- HTTP en Gleam → Wisp/Mist son estables pero jóvenes
+### Mitigatable risks
+- Manual JSON → use `gleam_experimental` or custom wrapper
+- libsql_gleam → keep abstraction layer for swap if needed
+- Gleam HTTP → Wisp/Mist are stable but young
 
-## Alternativas consideradas
+## Alternatives considered
 
-### A) Mantener Sacrum Elixir + Vertebrae Rust
-- Pros: maduro, probado
-- Contras: no embedded, requiere servidor separado
+### A) Keep Sacrum Elixir + Vertebrae Rust
+- Pros: mature, proven
+- Cons: not embedded, requires separate server
 
-### B) Tauri + Rust backend (actual crates/local-backend/)
-- Pros: mismo ecosistema que Vertebrae
-- Contras: no BEAM/OTP, menos natural para workflows stateful
+### B) Tauri + Rust backend (current crates/local-backend/)
+- Pros: same ecosystem as Vertebrae
+- Cons: no BEAM/OTP, less natural for stateful workflows
 
 ### C) Gleam + PostgreSQL
-- Pros: compatible con Sacrum actual
-- Contras: no embedded, pierde la ventaja local-first
+- Pros: compatible with current Sacrum
+- Cons: not embedded, loses local-first advantage
