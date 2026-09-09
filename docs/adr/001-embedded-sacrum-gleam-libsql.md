@@ -1,4 +1,4 @@
-# ADR-001: Embedded Sacrum in Gleam with libsql/Turso
+# ADR-001: Embedded Crystalline in Gleam with libsql/Turso
 
 ## Status
 Proposed
@@ -29,7 +29,7 @@ with later migration to Turso (remote access), we need a self-contained backend.
 | HTTP Server | **Mist** | Native Gleam HTTP server |
 | Web Framework | **Wisp** | Practical Gleam web framework |
 | Database | **libsql_gleam** (Rust NIF) | Local SQLite → remote Turso without code changes |
-| GUI Shell | **Tauri** (TBD) | Native shell, WebView for UI |
+| GUI Shell | **Facet** (TBD) | Tauri desktop client |
 | Frontend Web | **Lustre** (TBD) | Gleam UI framework if SPA needed |
 
 ### Moldable Flow Architecture
@@ -63,7 +63,7 @@ FlowTemplate (reusable definition)
 ### Persistence
 
 ```
-Local:    libsql file:sacrum.db (same process)
+Local:    libsql file:crystalline.db (same process)
 Remote:   libsql libsql://db.turso.io (no code changes)
 ```
 
