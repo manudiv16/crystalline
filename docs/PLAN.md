@@ -13,11 +13,13 @@ Project scaffolded with domain, flow engine, and DB layer implemented:
 - ✅ Flow Engine: validator, executor, engine with builders
 - ✅ Database: connection, migrations, tasks/flows/executions CRUD
 - ✅ SQL migration: 0001_init.sql
+- ✅ Agent Harness (C9): provider-neutral contract, Claude Code adapter, provider registry
 
 Build pending fix (gleam_json vs gleam_stdlib v1 incompatibility resolved, remaining imports and Gleam 1.14 semicolons).
 
 ## Phases
 
+<!-- markdownlint-disable MD029 -->
 ### Phase 1: Foundation (sequential)
 1. **Fix build**: resolve imports, semicolons, manual JSON encoding
 2. **Unit tests**: domain types, flow validator, flow executor
@@ -44,6 +46,7 @@ Build pending fix (gleam_json vs gleam_stdlib v1 incompatibility resolved, remai
 ### Phase 5: Turso Remote (parallelizable)
 16. **Remote connection mode**: URL auth token, no logic changes
 17. **Sync/conflict resolution**: eventual consistency for offline→online
+<!-- markdownlint-enable MD029 -->
 
 ## Dependency Diagram
 
