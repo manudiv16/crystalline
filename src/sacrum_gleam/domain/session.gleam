@@ -1,8 +1,5 @@
-import gleam/option.{Option, Some, None}
-
 /// Session logs for step executions.
 /// Each step execution produces a stream of events (text, tool use, usage).
-
 pub type SessionLog {
   SessionLog(
     id: String,

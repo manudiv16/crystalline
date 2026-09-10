@@ -18,6 +18,11 @@ jobs:
           gleam-version: "1.18.1"
           rebar3-version: "3"
           # elixir-version: "1"
+      # The libsql_gleam NIF is not shipped by its hex package (no release
+      # assets upstream), so the Rust NIF is built from source before any
+      # database-backed code can run. See scripts/build-libsql-nif.sh.
+      - uses: dtolnay/rust-toolchain@stable
+      - run: bash scripts/build-libsql-nif.sh
       - run: gleam deps download
       - run: gleam test
       - run: gleam format --check src test

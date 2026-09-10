@@ -17,7 +17,7 @@ See [Facet](https://github.com/manudiv16/facet) for the CLI and desktop client.
 ## Stack
 
 | Layer | Technology |
-|---|---|
+| --- | --- |
 | Language | Gleam 1.14+ (BEAM) |
 | HTTP | Wisp + Mist |
 | Database | `libsql_gleam` (Rust NIF over libsql) |
@@ -29,13 +29,83 @@ Local:   libsql file:crystalline.db
 Remote:  libsql libsql://<db>.turso.io
 ```
 
+## Database modes
+
+The mode is chosen once at startup, in this order:
+
+1. `CRYSTALLINE_DB_URL` + `CRYSTALLINE_AUTH_TOKEN` — **remote** (Turso).
+   `libsql://` and `https://` URLs are supported.
+2. `CRYSTALLINE_DB` — local file path (or `:memory:`).
+3. Default: `file:crystalline.db` in the working directory.
+
+The connection is open through the same `connect` path for both modes, and the
+embedded migration runner runs identically against local and remote databases
+(`schema_migrations` table and all).
+
+### Fail fast on a missing token
+
+A remote URL without a token is a configuration error, not a flaky connection:
+
+```sh
+CRYSTALLINE_DB_URL=libsql://acme.turso.io gleam run
+# → missing auth token for remote database: CRYSTALLINE_DB_URL=... is set but
+#   CRYSTALLINE_AUTH_TOKEN is not set.
+#   Set CRYSTALLINE_AUTH_TOKEN to connect to a remote database.
+#   (exit code 1)
+```
+
+The process refuses to start rather than half-attaching to the network.
+
+### `/health`
+
+`GET /health` reports the resolved mode so operators can tell which database
+is backing the instance:
+
+```json
+{ "status": "ok", "version": "1.0.0", "db_mode": "remote" }
+```
+
+`db_mode` is `local` or `remote`. The auth token is **never** echoed, neither
+here nor in logs.
+
+### ⚠️ Two-writer caveat for shared remote databases
+
+Migrations are run by **every** Crystalline instance at startup. With a single
+instance this is idempotent and safe; with several instances pointing at the
+same Turso database (e.g. two laptops, CI and prod, or a hot-reloaded dev
+server) you can hit two writers: both may apply a new migration at the same
+instant, and concurrent writes can race `SQLITE_BUSY`.
+
+Rules of thumb:
+
+- Point one long-lived instance per shared remote database where practical
+  (e.g. one server, and `:memory:` or a local file for ephemeral dev work).
+- Treat the embedded runner as apply-on-boot: add a new migration, deploy one
+  instance, then deploy the rest. Do not write migrations from a REPL or
+  test runner against a shared database.
+- libsql/Turso serializes writes at the primary, but it does not make two
+  concurrent migration runners atomic.
+
+### Root database configuration
+
+Every `connect` call takes the URL and an optional token and routes to
+`libsql.open` (local) or `libsql.open_remote` (remote) internally:
+
+```gleam
+let assert Ok(conn) = sacrum_gleam.connect("libsql://acme.turso.io", Some(token))
+let assert Ok(conn) = sacrum_gleam.connect("file:crystalline.db", None)
+```
+
+A remote URL passed **without** a token fails fast with a `ConnectionError`
+instead of surfacing a low-level libsql error.
+
 ## Moldable flows
 
 A flow is a reusable graph of composable nodes, so a task can be given a loop, a branch,
 a parallel fan-out or a human gate — or none of them.
 
 | Node type | Semantics |
-|---|---|
+| --- | --- |
 | `Step` | Run an agent with a prompt and `AgentConfig` |
 | `Sequence` | Run children in order |
 | `Branch` | Evaluate conditions, pick a target |
@@ -63,7 +133,7 @@ stabilized and the HTTP surface is not implemented yet.
 Work is tracked as dependency-linked issues so it can be parallelized:
 
 | # | Task | Blocked by |
-|---|---|---|
+| --- | --- | --- |
 | [#1](https://github.com/manudiv16/crystalline/issues/1) | Compile and stabilize core modules | — |
 | [#2](https://github.com/manudiv16/crystalline/issues/2) | JSON codec module | #1 |
 | [#3](https://github.com/manudiv16/crystalline/issues/3) | Migrations runner | #1 |
@@ -84,19 +154,27 @@ Plan: [`docs/PLAN.md`](docs/PLAN.md).
 ## Development
 
 ```sh
+bash scripts/build-libsql-nif.sh  # build the Rust NIF once (see below)
 gleam run   # Start the HTTP server
 gleam test  # Run the tests
 gleam build # Compile
 ```
 
+> **libsql NIF.** The `libsql_gleam` hex package does not ship a compiled NIF
+> and its upstream release download is a placeholder, so the Rust NIF is built
+> from source via `scripts/build-libsql-nif.sh` (pinned to a known-good
+> upstream commit) and installed into Erlang's user cache where the FFI loads
+> it. Run it once per machine (CI does it automatically).
+
 Environment:
 
 | Variable | Default | Purpose |
-|---|---|---|
-| `PORT` | `8787` | HTTP listen port |
-| `CRYSTALLINE_DB` | `file:crystalline.db` | Local database URL |
-| `CRYSTALLINE_DB_URL` | — | Remote `libsql://` URL |
-| `CRYSTALLINE_AUTH_TOKEN` | — | Token for the remote URL |
+| --- | --- | --- |
+| `PORT` | `4920` | HTTP listen port |
+| `CRYSTALLINE_DB` | `file:crystalline.db` | Local database URL (`file:` path or `:memory:`) |
+| `CRYSTALLINE_DB_URL` | — | Remote `libsql://`/`https://` URL (takes precedence) |
+| `CRYSTALLINE_AUTH_TOKEN` | — | Token for the remote URL (required when `CRYSTALLINE_DB_URL` is set) |
+| `CRYSTALLINE_SECRET_KEY_BASE` | dev-only value | Wisp cookie/signing secret |
 
 ## Related
 

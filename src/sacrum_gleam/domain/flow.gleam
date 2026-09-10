@@ -1,6 +1,5 @@
-import gleam/dict
-import gleam/option.{Option, Some, None}
-import gleam/list
+import gleam/dict.{type Dict}
+import gleam/option.{type Option, None}
 
 /// The core innovation: moldable, composable agent control flows.
 ///
@@ -16,9 +15,6 @@ import gleam/list
 ///
 /// Nodes can nest: a Sequence can contain a Loop, a Branch can contain
 /// Steps, etc. The engine resolves the graph recursively at execution time.
-
-// ─── Node Type ───────────────────────────────────────────────────────────
-
 pub type NodeType {
   Step
   Sequence

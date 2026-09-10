@@ -7,18 +7,21 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 DB=/tmp/c6_verify.db
 rm -f "$DB"
-sqlite3 "$DB" < migrations/0001_init.sql
+sqlite3 "$DB" <migrations/0001_init.sql
 
 fail=0
 note() { printf '%s\n' "$*"; }
 check() { # check <name> <expected> <actual>
-  if [ "$2" = "$3" ]; then note "PASS: $1"; else note "FAIL: $1 (expected [$2], got [$3])"; fail=1; fi
+	if [ "$2" = "$3" ]; then note "PASS: $1"; else
+		note "FAIL: $1 (expected [$2], got [$3])"
+		fail=1
+	fi
 }
 
 # Helper to insert a task row exactly as db/tasks.gleam create_task does.
 insert_task() { # id short_id title level priority parent
-  sqlite3 "$DB" "INSERT INTO tasks (id, short_id, title, description, level, priority, status, tags, parent_id, flow_template_id, flow_instance_id, current_node_id, worktree, archived, created_at, updated_at)
-  VALUES ('$1','$2','$3','','$4','$5','todo','[]', $( [ -n "${6:-}" ] && echo "'$6'" || echo NULL ), NULL,NULL,NULL,NULL,0,0,0);"
+	sqlite3 "$DB" "INSERT INTO tasks (id, short_id, title, description, level, priority, status, tags, parent_id, flow_template_id, flow_instance_id, current_node_id, worktree, archived, created_at, updated_at)
+  VALUES ('$1','$2','$3','','$4','$5','todo','[]', $([ -n "${6:-}" ] && echo "'$6'" || echo NULL), NULL,NULL,NULL,NULL,0,0,0);"
 }
 
 # ─── 1. POST /api/v1/tasks equivalent: insert returns the new task ────────
@@ -28,14 +31,15 @@ check "1. create task row (short_id stored)" "00000001" "$(sqlite3 "$DB" "SELECT
 # ─── 2. Missing title → NOT NULL constraint (route returns 400) ───────────
 # (route-level 400 handled by validate_create_input; DB enforces NOT NULL)
 if sqlite3 "$DB" "INSERT INTO tasks (id, short_id, title, level, priority, created_at, updated_at) VALUES ('bad','00000009',NULL,'ticket','high',0,0)" 2>/dev/null; then
-  note "UNEXPECTED: null title insert succeeded"; fail=1
+	note "UNEXPECTED: null title insert succeeded"
+	fail=1
 else
-  note "PASS: 2. missing title rejected by schema (route maps to 400)"
+	note "PASS: 2. missing title rejected by schema (route maps to 400)"
 fi
 
 # ─── 3. /ready excludes tasks with incomplete deps ────────────────────────
 insert_task "t2" "00000002" "Depends on foundation" "ticket" "high" ""
-sqlite3 "$DB" "INSERT INTO task_dependencies (task_id, depends_on) VALUES ('t2','t1')" 
+sqlite3 "$DB" "INSERT INTO task_dependencies (task_id, depends_on) VALUES ('t2','t1')"
 
 READY_BEFORE=$(sqlite3 "$DB" "
 SELECT id FROM tasks
@@ -142,11 +146,11 @@ ORDER BY t.created_at DESC")
 check "6b. completed blockers are dropped from the list" "" "$BLOCKERS_AFTER"
 
 if [ $fail -eq 0 ]; then
-  note ""
-  note "ALL C6 DB-LAYER CHECKS PASSED"
+	note ""
+	note "ALL C6 DB-LAYER CHECKS PASSED"
 else
-  note ""
-  note "SOME CHECKS FAILED"
+	note ""
+	note "SOME CHECKS FAILED"
 fi
 rm -f "$DB"
 exit $fail

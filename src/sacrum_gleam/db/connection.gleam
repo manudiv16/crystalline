@@ -1,9 +1,12 @@
-import libsql_gleam
+import gleam/dynamic/decode
+import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/result
-import gleam/io
+import gleam/string
+import libsql
 
 pub type DbConnection {
-  DbConnection(conn: libsql_gleam.Connection)
+  DbConnection(conn: libsql.Connection)
 }
 
 pub type DbError {
@@ -12,38 +15,145 @@ pub type DbError {
   MigrationError(message: String)
 }
 
-/// Connect to a libsql database.
-/// Path can be:
-/// - A file path for local SQLite: "file:/path/to/db.sqlite"
-/// - An in-memory database: ":memory:"
-/// - A Turso remote URL: "libsql://db.turso.io"
-pub fn connect(db_url: String) -> Result(DbConnection, DbError) {
-  case libsql_gleam.connect(db_url) {
-    Ok(conn) -> Ok(DbConnection(conn: conn))
-    Error(err) -> Error(ConnectionError(libsql_gleam.error_message(err)))
+/// A dynamically-typed SQL value.
+///
+/// `libsql` exposes opaque values and a decoder-first query API. The rest of
+/// the persistence layer works with this small tagged union instead, which
+/// keeps row mapping and parameter building explicit and testable.
+pub type Value {
+  TextVal(String)
+  IntVal(Int)
+  FloatVal(Float)
+  BlobVal(BitArray)
+  NullVal
+}
+
+fn to_libsql(value: Value) -> libsql.Value {
+  case value {
+    TextVal(v) -> libsql.text(v)
+    IntVal(v) -> libsql.int(v)
+    FloatVal(v) -> libsql.float(v)
+    BlobVal(v) -> libsql.blob(v)
+    NullVal -> libsql.null()
   }
 }
 
-/// Execute a raw SQL statement.
+fn to_libsql_params(params: List(Value)) -> List(libsql.Value) {
+  list.map(params, to_libsql)
+}
+
+fn cell_decoder() -> decode.Decoder(Value) {
+  decode.optional(
+    decode.one_of(decode.string |> decode.map(TextVal), [
+      decode.int |> decode.map(IntVal),
+      decode.float |> decode.map(FloatVal),
+      decode.bit_array |> decode.map(BlobVal),
+    ]),
+  )
+  |> decode.map(fn(value) {
+    case value {
+      Some(value) -> value
+      None -> NullVal
+    }
+  })
+}
+
+fn row_decoder() -> decode.Decoder(List(Value)) {
+  decode.list(cell_decoder())
+}
+
+/// Connect to a libsql database. One entry point for local and remote.
+///
+/// `db_url` is either:
+/// - A local path: "file:/path/to/db.sqlite", ":memory:", or a bare path
+/// - A Turso remote URL: "libsql://db.turso.io" or "https://db.turso.io"
+///
+/// When `auth_token` is `Some`, the connection is opened in remote mode
+/// (Turso). A remote-looking URL **without** a token fails fast with a clear
+/// error instead of surfacing a confusing libsql error.
+pub fn connect(
+  db_url: String,
+  auth_token: Option(String),
+) -> Result(DbConnection, DbError) {
+  case auth_token {
+    Some(token) -> {
+      case libsql.open_remote(db_url, token) {
+        Ok(conn) -> Ok(DbConnection(conn: conn))
+        Error(err) -> Error(ConnectionError(err.message))
+      }
+    }
+    None -> {
+      case is_remote_url(db_url) {
+        True ->
+          Error(ConnectionError(
+            "remote database URL '"
+            <> db_url
+            <> "' requires an auth token; pass one to `connect` or set "
+            <> "CRYSTALLINE_AUTH_TOKEN",
+          ))
+        False -> {
+          case libsql.open(db_url) {
+            Ok(conn) -> Ok(DbConnection(conn: conn))
+            Error(err) -> Error(ConnectionError(err.message))
+          }
+        }
+      }
+    }
+  }
+}
+
+/// Whether a database URL refers to a remote (Turso) database.
+///
+/// Local SQLite paths and `:memory:` are never remote.
+pub fn is_remote_url(db_url: String) -> Bool {
+  string.starts_with(db_url, "libsql://")
+  || string.starts_with(db_url, "https://")
+  || string.starts_with(db_url, "http://")
+  || string.starts_with(db_url, "wss://")
+}
+
+/// Execute a SQL statement with optional parameters.
 pub fn execute(
   conn: DbConnection,
   sql: String,
+  params: List(Value),
 ) -> Result(Nil, DbError) {
-  case libsql_gleam.execute(conn.conn, sql, []) {
-    Ok(_) -> Ok(Nil)
-    Error(err) -> Error(QueryError(libsql_gleam.error_message(err)))
+  case params {
+    [] -> {
+      case libsql.exec(sql, on: conn.conn) {
+        Ok(_) -> Ok(Nil)
+        Error(err) -> Error(QueryError(err.message))
+      }
+    }
+    _ -> {
+      case
+        libsql.with_statement(sql, on: conn.conn, run: fn(stmt) {
+          libsql.exec_prepared(on: stmt, with: to_libsql_params(params))
+        })
+      {
+        Ok(_) -> Ok(Nil)
+        Error(err) -> Error(QueryError(err.message))
+      }
+    }
   }
 }
 
-/// Execute a query that returns rows.
+/// Execute a query with parameters and return the raw rows.
 pub fn query(
   conn: DbConnection,
   sql: String,
-  params: List(libsql_gleam.Value),
-) -> Result(List(List(libsql_gleam.Value)), DbError) {
-  case libsql_gleam.query(conn.conn, sql, params) {
+  params: List(Value),
+) -> Result(List(List(Value)), DbError) {
+  case
+    libsql.query(
+      sql,
+      on: conn.conn,
+      with: to_libsql_params(params),
+      expecting: row_decoder(),
+    )
+  {
     Ok(rows) -> Ok(rows)
-    Error(err) -> Error(QueryError(libsql_gleam.error_message(err)))
+    Error(err) -> Error(QueryError(err.message))
   }
 }
 
@@ -51,12 +161,12 @@ pub fn query(
 pub fn query_one(
   conn: DbConnection,
   sql: String,
-  params: List(libsql_gleam.Value),
-) -> Result(List(libsql_gleam.Value), DbError) {
-  case query(conn, sql, params) {
-    Ok([row, ..]) -> Ok(row)
-    Ok([]) -> Error(QueryError("No rows returned"))
-    Error(e) -> Error(e)
+  params: List(Value),
+) -> Result(List(Value), DbError) {
+  use rows <- result.try(query(conn, sql, params))
+  case rows {
+    [row, ..] -> Ok(row)
+    [] -> Error(QueryError("No rows returned"))
   }
 }
 
@@ -65,22 +175,32 @@ pub fn transaction(
   conn: DbConnection,
   statements: List(String),
 ) -> Result(Nil, DbError) {
-  use _ <- result.try(execute(conn, "BEGIN"))
+  use _ <- result.try(execute(conn, "BEGIN", []))
 
   let result = run_batch(conn, statements)
 
   case result {
-    Ok(_) -> execute(conn, "COMMIT")
+    Ok(_) -> execute(conn, "COMMIT", [])
     Error(e) -> {
-      let _ = execute(conn, "ROLLBACK")
+      let _ = execute(conn, "ROLLBACK", [])
       Error(e)
     }
   }
 }
 
+/// Convert a DbError to a human-readable string.
+pub fn error_to_string(error: DbError) -> String {
+  case error {
+    ConnectionError(message) -> message
+    QueryError(message) -> message
+    MigrationError(message) -> message
+  }
+}
+
 /// Close the database connection.
 pub fn close(conn: DbConnection) -> Nil {
-  libsql_gleam.close(conn.conn)
+  let _ = libsql.close(conn.conn)
+  Nil
 }
 
 /// Run multiple statements in sequence, stopping on first error.
@@ -98,7 +218,7 @@ fn run_batch_inner(
   case remaining {
     [] -> Ok(Nil)
     [sql, ..rest] -> {
-      case execute(conn, sql) {
+      case execute(conn, sql, []) {
         Ok(_) -> run_batch_inner(conn, rest)
         Error(e) -> Error(e)
       }

@@ -1,7 +1,9 @@
-import gleam/dict.{Dict}
+import gleam/dict.{type Dict}
+import gleam/list
+import gleam/option.{None, Some}
 import gleam/result
 import sacrum_gleam/domain/flow.{
-  FlowTemplate, Node, NodeType, Transition, BranchRule,
+  type BranchRule, type FlowTemplate, type Node, type Transition,
 }
 
 /// Validates that a FlowTemplate is well-formed before it can be used.
@@ -16,7 +18,6 @@ import sacrum_gleam/domain/flow.{
 /// 7. Loop config child_ids reference existing nodes
 /// 8. Step nodes have a prompt
 /// 9. Composite nodes have at least one child
-
 pub type ValidationError {
   DuplicateNodeId(id: String)
   MissingInitialNode(id: String)
@@ -31,13 +32,13 @@ pub type ValidationError {
 pub fn validate(template: FlowTemplate) -> Result(Nil, List(ValidationError)) {
   let nodes = template.nodes
 
-  use <- result.try(validate_unique_ids(nodes))
-  use <- result.try(validate_initial_node(template.initial_node_id, nodes))
-  use <- result.try(validate_child_refs(nodes))
-  use <- result.try(validate_transitions(template.transitions, nodes))
-  use <- result.try(validate_branch_rules(nodes))
-  use <- result.try(validate_step_prompts(nodes))
-  use <- result.try(validate_composite_children(nodes))
+  use _ <- result.try(validate_unique_ids(nodes))
+  use _ <- result.try(validate_initial_node(template.initial_node_id, nodes))
+  use _ <- result.try(validate_child_refs(nodes))
+  use _ <- result.try(validate_transitions(template.transitions, nodes))
+  use _ <- result.try(validate_branch_rules(nodes))
+  use _ <- result.try(validate_step_prompts(nodes))
+  use _ <- result.try(validate_composite_children(nodes))
 
   // Cycle detection: allow cycles only through Loop nodes
   case find_illegal_cycles(template) {
@@ -47,7 +48,7 @@ pub fn validate(template: FlowTemplate) -> Result(Nil, List(ValidationError)) {
 }
 
 fn validate_unique_ids(
-  nodes: Dict(String, Node),
+  _nodes: Dict(String, Node),
 ) -> Result(Nil, List(ValidationError)) {
   // IDs are dict keys, so they're unique by construction
   Ok(Nil)
@@ -72,12 +73,8 @@ fn validate_child_refs(
     |> list.flat_map(fn(pair) {
       let #(id, node) = pair
       node.child_ids
-      |> list.filter(fn(cid) {
-        dict.get(nodes, cid) == Error(Nil)
-      })
-      |> list.map(fn(cid) {
-        MissingChildRef(id, cid)
-      })
+      |> list.filter(fn(cid) { dict.get(nodes, cid) == Error(Nil) })
+      |> list.map(fn(cid) { MissingChildRef(id, cid) })
     })
 
   case errors {
@@ -118,12 +115,8 @@ fn validate_branch_rules(
     |> dict.values
     |> list.flat_map(fn(node) {
       node.branch_rules
-      |> list.filter(fn(rule) {
-        dict.get(nodes, rule.target_id) == Error(Nil)
-      })
-      |> list.map(fn(rule) {
-        MissingBranchTarget(rule)
-      })
+      |> list.filter(fn(rule) { dict.get(nodes, rule.target_id) == Error(Nil) })
+      |> list.map(fn(rule) { MissingBranchTarget(rule) })
     })
 
   case errors {
@@ -210,7 +203,9 @@ fn build_adjacency(template: FlowTemplate) -> Dict(String, List(String)) {
       case is_composite, node.child_ids {
         True, [first, ..rest] ->
           list.zip([first, ..rest], rest)
-          |> list.append(node.child_ids |> list.take(1) |> list.map(fn(c) { #(node.id, c) }))
+          |> list.append(
+            node.child_ids |> list.take(1) |> list.map(fn(c) { #(node.id, c) }),
+          )
         _, _ -> []
       }
     })
@@ -231,9 +226,7 @@ fn detect_cycle_dfs(
   nodes: Dict(String, Node),
 ) -> List(ValidationError) {
   ids
-  |> list.filter_map(fn(id) {
-    dfs_visit(id, adj, nodes, [], dict.new())
-  })
+  |> list.filter_map(fn(id) { dfs_visit(id, adj, nodes, [], dict.new()) })
 }
 
 fn dfs_visit(
@@ -242,24 +235,31 @@ fn dfs_visit(
   nodes: Dict(String, Node),
   path: List(String),
   visited: Dict(String, Bool),
-) -> Option(ValidationError) {
+) -> Result(ValidationError, Nil) {
   case dict.get(nodes, node_id) {
-    Error(Nil) -> None
+    Error(Nil) -> Error(Nil)
     Ok(node) -> {
-      // Loop nodes are allowed to cycle back
-      let is_loop = node.node_type == flow.Loop
-      let new_path = [node_id, ..path]
+      // Do not revisit a node already explored by this DFS run.
+      case dict.has_key(visited, node_id) {
+        True -> Error(Nil)
+        False -> {
+          // Loop nodes are allowed to cycle back
+          let is_loop = node.node_type == flow.Loop
+          let new_path = [node_id, ..path]
+          let new_visited = dict.insert(visited, node_id, True)
 
-      let neighbors = dict.get(adj, node_id) |> result.unwrap([])
-      neighbors
-      |> list.find_map(fn(nid) {
-        case list.contains(path, nid), is_loop {
-          True, False ->
-            Some(CycleDetected(list.reverse([nid, ..new_path])))
-          True, True -> None // Loop nodes can cycle
-          False, _ -> dfs_visit(nid, adj, nodes, new_path, visited)
+          let neighbors = dict.get(adj, node_id) |> result.unwrap([])
+          neighbors
+          |> list.find_map(fn(nid) {
+            case list.contains(path, nid), is_loop {
+              True, False -> Ok(CycleDetected(list.reverse([nid, ..new_path])))
+              True, True -> Error(Nil)
+              // Loop nodes can cycle
+              False, _ -> dfs_visit(nid, adj, nodes, new_path, new_visited)
+            }
+          })
         }
-      })
+      }
     }
   }
 }

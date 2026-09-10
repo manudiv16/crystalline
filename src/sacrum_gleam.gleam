@@ -16,7 +16,7 @@
 /// import sacrum_gleam
 ///
 /// // Connect to embedded DB
-/// let conn = sacrum_gleam.connect(":memory:")
+/// let conn = sacrum_gleam.connect(":memory:", None)
 ///
 /// // Create a linear flow
 /// let flow = sacrum_gleam.build_linear_flow(
@@ -35,50 +35,95 @@
 /// let assert #(engine, instance) = sacrum_gleam.instantiate_flow(engine, flow.id, "task-1")
 /// let assert #(engine, _, action) = sacrum_gleam.advance_execution(engine, instance.id)
 /// ```
-
-import sacrum_gleam/domain/task as task
-import sacrum_gleam/domain/section as section
-import sacrum_gleam/domain/flow as flow
-import sacrum_gleam/domain/execution as execution
-import sacrum_gleam/domain/session as session
-import sacrum_gleam/flow/engine as engine
-import sacrum_gleam/flow/validator as validator
-import sacrum_gleam/db/connection as connection
+import crystalline
+import gleam/option.{type Option}
+import sacrum_gleam/db/connection
+import sacrum_gleam/domain/execution
+import sacrum_gleam/domain/flow
+import sacrum_gleam/domain/section
+import sacrum_gleam/domain/session
+import sacrum_gleam/domain/task
+import sacrum_gleam/flow/engine
+import sacrum_gleam/flow/executor
+import sacrum_gleam/flow/validator
 
 // Domain type aliases for convenience
-pub type Task = task.Task
-pub type Level = task.Level
-pub type Priority = task.Priority
-pub type TaskStatus = task.TaskStatus
-pub type CodeRef = task.CodeRef
+pub type Task =
+  task.Task
 
-pub type Section = section.Section
-pub type SectionType = section.SectionType
+pub type Level =
+  task.Level
 
-pub type FlowTemplate = flow.FlowTemplate
-pub type FlowInstance = flow.FlowInstance
-pub type Node = flow.Node
-pub type NodeType = flow.NodeType
-pub type Transition = flow.Transition
-pub type BranchRule = flow.BranchRule
-pub type LoopConfig = flow.LoopConfig
-pub type AgentConfig = flow.AgentConfig
+pub type Priority =
+  task.Priority
 
-pub type ExecutionState = execution.ExecutionState
-pub type ExecutionStatus = execution.ExecutionStatus
-pub type StepExecution = execution.StepExecution
-pub type StepStatus = execution.StepStatus
+pub type TaskStatus =
+  task.TaskStatus
 
-pub type SessionLog = session.SessionLog
+pub type CodeRef =
+  task.CodeRef
+
+pub type Section =
+  section.Section
+
+pub type SectionType =
+  section.SectionType
+
+pub type FlowTemplate =
+  flow.FlowTemplate
+
+pub type FlowInstance =
+  flow.FlowInstance
+
+pub type Node =
+  flow.Node
+
+pub type NodeType =
+  flow.NodeType
+
+pub type Transition =
+  flow.Transition
+
+pub type BranchRule =
+  flow.BranchRule
+
+pub type LoopConfig =
+  flow.LoopConfig
+
+pub type AgentConfig =
+  flow.AgentConfig
+
+pub type ExecutionState =
+  execution.ExecutionState
+
+pub type ExecutionStatus =
+  execution.ExecutionStatus
+
+pub type StepExecution =
+  execution.StepExecution
+
+pub type StepStatus =
+  execution.StepStatus
+
+pub type SessionLog =
+  session.SessionLog
 
 // Flow engine types
-pub type Engine = engine.Engine
-pub type EngineError = engine.EngineError
-pub type Action = engine.Action
+pub type Engine =
+  engine.Engine
+
+pub type EngineError =
+  engine.EngineError
+
+pub type Action =
+  executor.Action
 
 // Database types
-pub type DbConnection = connection.DbConnection
-pub type DbError = connection.DbError
+pub type DbConnection =
+  connection.DbConnection
+
+pub type DbError =
+  connection.DbError
 
 // ─── Constructors ─────────────────────────────────────────────────────────
 
@@ -146,11 +191,17 @@ pub fn execution_status_to_string(s: ExecutionStatus) -> String {
 
 // ─── Flow Engine ─────────────────────────────────────────────────────────
 
-pub fn register_template(e: Engine, t: FlowTemplate) -> Result(Engine, EngineError) {
+pub fn register_template(
+  e: Engine,
+  t: FlowTemplate,
+) -> Result(Engine, EngineError) {
   engine.register_template(e, t)
 }
 
-pub fn get_template(e: Engine, id: String) -> Result(FlowTemplate, EngineError) {
+pub fn get_template(
+  e: Engine,
+  id: String,
+) -> Result(FlowTemplate, EngineError) {
   engine.get_template(e, id)
 }
 
@@ -190,7 +241,10 @@ pub fn provide_input(
   engine.provide_input(e, instance_id, input)
 }
 
-pub fn get_execution(e: Engine, id: String) -> Result(ExecutionState, EngineError) {
+pub fn get_execution(
+  e: Engine,
+  id: String,
+) -> Result(ExecutionState, EngineError) {
   engine.get_execution(e, id)
 }
 
@@ -230,8 +284,13 @@ pub fn build_loop_flow(
   max_iterations: Int,
 ) -> FlowTemplate {
   engine.build_loop_flow(
-    name, description, pre_loop, loop_steps, post_loop,
-    exit_condition, max_iterations,
+    name,
+    description,
+    pre_loop,
+    loop_steps,
+    post_loop,
+    exit_condition,
+    max_iterations,
   )
 }
 
@@ -243,16 +302,33 @@ pub fn build_branch_flow(
   fallback_step: Option(#(String, String)),
 ) -> FlowTemplate {
   engine.build_branch_flow(
-    name, description, initial_step, branch_rules, fallback_step,
+    name,
+    description,
+    initial_step,
+    branch_rules,
+    fallback_step,
   )
 }
 
-pub fn validate_flow(t: FlowTemplate) -> Result(Nil, List(validator.ValidationError)) {
+pub fn validate_flow(
+  t: FlowTemplate,
+) -> Result(Nil, List(validator.ValidationError)) {
   validator.validate(t)
 }
 
 // ─── Database ─────────────────────────────────────────────────────────────
 
-pub fn connect(db_url: String) -> Result(DbConnection, DbError) {
-  connection.connect(db_url)
+pub fn connect(
+  db_url: String,
+  auth_token: Option(String),
+) -> Result(DbConnection, DbError) {
+  connection.connect(db_url, auth_token)
+}
+
+// ─── Application entrypoint ───────────────────────────────────────────────
+
+/// Entry point used by `gleam run`. The actual bootstrap (PORT resolution,
+/// server start, blocking) lives in `crystalline.main`.
+pub fn main() -> Nil {
+  crystalline.main()
 }

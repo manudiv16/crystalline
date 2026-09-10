@@ -1,23 +1,61 @@
-import gleam/dict.{Dict}
-import gleam/option.{Option, Some, None}
-import libsql_gleam
-import sacrum_gleam/db/connection.{DbConnection, DbError}
+import gleam/list
+import gleam/option.{type Option, None, Some}
+import gleam/result
+import sacrum_gleam/db/connection.{type DbConnection, type DbError}
 import sacrum_gleam/domain/flow.{
-  FlowTemplate, FlowInstance, Node, Transition,
+  type FlowInstance, type FlowTemplate, FlowInstance, FlowTemplate,
 }
+import sacrum_gleam/json/codec
 
 /// Flow template and instance persistence.
+/// Explicit column list for the flow_templates table (matches schema order).
+const flow_template_columns = [
+  "id",
+  "name",
+  "description",
+  "initial_node_id",
+  "nodes_json",
+  "transitions_json",
+  "on_done_template_id",
+  "on_reject_template_id",
+  "created_at",
+  "updated_at",
+]
+
+/// Explicit column list for the flow_instances table (matches schema order).
+const flow_instance_columns = [
+  "id",
+  "template_id",
+  "task_id",
+  "initial_node_id",
+  "nodes_json",
+  "transitions_json",
+  "on_done_template_id",
+  "on_reject_template_id",
+  "created_at",
+]
+
+fn template_columns_sql() -> String {
+  string_join(flow_template_columns, ", ")
+}
+
+fn string_join(items: List(String), separator: String) -> String {
+  case items {
+    [] -> ""
+    [first, ..rest] ->
+      rest
+      |> list.fold(first, fn(acc, item) { acc <> separator <> item })
+  }
+}
 
 // ─── Flow Templates ──────────────────────────────────────────────────────
 
+/// Create a flow template row. Returns the template ID.
 pub fn create_flow_template(
   conn: DbConnection,
   template: FlowTemplate,
   now: Int,
 ) -> Result(String, DbError) {
-  let nodes_json = encode_nodes(template.nodes)
-  let transitions_json = encode_transitions(template.transitions)
-
   let sql = {
     "INSERT INTO flow_templates "
     <> "(id, name, description, initial_node_id, nodes_json, "
@@ -27,48 +65,52 @@ pub fn create_flow_template(
   }
 
   let params = [
-    libsql_gleam.TextVal(template.id),
-    libsql_gleam.TextVal(template.name),
-    libsql_gleam.TextVal(template.description),
-    libsql_gleam.TextVal(template.initial_node_id),
-    libsql_gleam.TextVal(nodes_json),
-    libsql_gleam.TextVal(transitions_json),
+    connection.TextVal(template.id),
+    connection.TextVal(template.name),
+    connection.TextVal(template.description),
+    connection.TextVal(template.initial_node_id),
+    connection.TextVal(codec.encode_nodes(template.nodes)),
+    connection.TextVal(codec.encode_transitions(template.transitions)),
     option_to_text(template.on_done_template_id),
     option_to_text(template.on_reject_template_id),
-    libsql_gleam.IntVal(now),
-    libsql_gleam.IntVal(now),
+    connection.IntVal(now),
+    connection.IntVal(now),
   ]
 
-  use _ <- connection.query(conn, sql, params)
+  use _ <- result.try(connection.query(conn, sql, params))
   Ok(template.id)
 }
 
+/// Get a flow template by ID.
 pub fn get_flow_template(
   conn: DbConnection,
   id: String,
 ) -> Result(FlowTemplate, DbError) {
-  let sql = "SELECT * FROM flow_templates WHERE id = ?"
-  use row <- connection.query_one(conn, sql, [libsql_gleam.TextVal(id)])
+  let sql =
+    "SELECT " <> template_columns_sql() <> " FROM flow_templates WHERE id = ?"
+  use row <- result.try(
+    connection.query_one(conn, sql, [connection.TextVal(id)]),
+  )
   row_to_template(row)
 }
 
+/// List all flow templates ordered by name.
 pub fn list_flow_templates(
   conn: DbConnection,
 ) -> Result(List(FlowTemplate), DbError) {
-  let sql = "SELECT * FROM flow_templates ORDER BY name"
-  use rows <- connection.query(conn, sql, [])
+  let sql =
+    "SELECT " <> template_columns_sql() <> " FROM flow_templates ORDER BY name"
+  use rows <- result.try(connection.query(conn, sql, []))
   list.map(rows, row_to_template) |> result.all
 }
 
+/// Update a flow template. Returns the updated template.
 pub fn update_flow_template(
   conn: DbConnection,
   id: String,
   template: FlowTemplate,
   now: Int,
 ) -> Result(FlowTemplate, DbError) {
-  let nodes_json = encode_nodes(template.nodes)
-  let transitions_json = encode_transitions(template.transitions)
-
   let sql = {
     "UPDATE flow_templates SET "
     <> "name = ?, description = ?, initial_node_id = ?, "
@@ -78,39 +120,55 @@ pub fn update_flow_template(
   }
 
   let params = [
-    libsql_gleam.TextVal(template.name),
-    libsql_gleam.TextVal(template.description),
-    libsql_gleam.TextVal(template.initial_node_id),
-    libsql_gleam.TextVal(nodes_json),
-    libsql_gleam.TextVal(transitions_json),
+    connection.TextVal(template.name),
+    connection.TextVal(template.description),
+    connection.TextVal(template.initial_node_id),
+    connection.TextVal(codec.encode_nodes(template.nodes)),
+    connection.TextVal(codec.encode_transitions(template.transitions)),
     option_to_text(template.on_done_template_id),
     option_to_text(template.on_reject_template_id),
-    libsql_gleam.IntVal(now),
-    libsql_gleam.TextVal(id),
+    connection.IntVal(now),
+    connection.TextVal(id),
   ]
 
-  use _ <- connection.query(conn, sql, params)
+  use _ <- result.try(connection.query(conn, sql, params))
   get_flow_template(conn, id)
 }
 
+/// Delete a flow template. Returns `Error` if the template is referenced by
+/// a flow instance (the schema uses `ON DELETE RESTRICT`).
 pub fn delete_flow_template(
   conn: DbConnection,
   id: String,
 ) -> Result(Nil, DbError) {
   let sql = "DELETE FROM flow_templates WHERE id = ?"
-  connection.execute(conn, sql, [libsql_gleam.TextVal(id)])
+  connection.execute(conn, sql, [connection.TextVal(id)])
+}
+
+/// Number of flow instances created from a template. Used to decide whether
+/// a template can be deleted.
+pub fn count_instances_for_template(
+  conn: DbConnection,
+  template_id: String,
+) -> Result(Int, DbError) {
+  use row <- result.try(
+    connection.query_one(
+      conn,
+      "SELECT COUNT(*) FROM flow_instances WHERE template_id = ?",
+      [connection.TextVal(template_id)],
+    ),
+  )
+  Ok(count_from_row(row))
 }
 
 // ─── Flow Instances ──────────────────────────────────────────────────────
 
+/// Create a flow instance row. Returns the instance ID.
 pub fn create_flow_instance(
   conn: DbConnection,
   instance: FlowInstance,
   now: Int,
 ) -> Result(String, DbError) {
-  let nodes_json = encode_nodes(instance.nodes)
-  let transitions_json = encode_transitions(instance.transitions)
-
   let sql = {
     "INSERT INTO flow_instances "
     <> "(id, template_id, task_id, initial_node_id, nodes_json, "
@@ -120,70 +178,95 @@ pub fn create_flow_instance(
   }
 
   let params = [
-    libsql_gleam.TextVal(instance.id),
-    libsql_gleam.TextVal(instance.template_id),
-    libsql_gleam.TextVal(instance.task_id),
-    libsql_gleam.TextVal(instance.initial_node_id),
-    libsql_gleam.TextVal(nodes_json),
-    libsql_gleam.TextVal(transitions_json),
+    connection.TextVal(instance.id),
+    connection.TextVal(instance.template_id),
+    connection.TextVal(instance.task_id),
+    connection.TextVal(instance.initial_node_id),
+    connection.TextVal(codec.encode_nodes(instance.nodes)),
+    connection.TextVal(codec.encode_transitions(instance.transitions)),
     option_to_text(instance.on_done_template_id),
     option_to_text(instance.on_reject_template_id),
-    libsql_gleam.IntVal(now),
+    connection.IntVal(now),
   ]
 
-  use _ <- connection.query(conn, sql, params)
+  use _ <- result.try(connection.query(conn, sql, params))
   Ok(instance.id)
 }
 
+/// Get a flow instance by ID.
 pub fn get_flow_instance(
   conn: DbConnection,
   id: String,
 ) -> Result(FlowInstance, DbError) {
-  let sql = "SELECT * FROM flow_instances WHERE id = ?"
-  use row <- connection.query_one(conn, sql, [libsql_gleam.TextVal(id)])
+  let sql =
+    "SELECT "
+    <> flow_instance_columns_sql()
+    <> " FROM flow_instances WHERE id = ?"
+  use row <- result.try(
+    connection.query_one(conn, sql, [connection.TextVal(id)]),
+  )
   row_to_instance(row)
 }
 
+/// Get the flow instance bound to a task, if any.
 pub fn get_instance_by_task(
   conn: DbConnection,
   task_id: String,
 ) -> Result(FlowInstance, DbError) {
-  let sql = "SELECT * FROM flow_instances WHERE task_id = ?"
-  use row <- connection.query_one(conn, sql, [libsql_gleam.TextVal(task_id)])
+  let sql =
+    "SELECT "
+    <> flow_instance_columns_sql()
+    <> " FROM flow_instances WHERE task_id = ?"
+  use row <- result.try(
+    connection.query_one(conn, sql, [connection.TextVal(task_id)]),
+  )
   row_to_instance(row)
 }
 
-// ─── JSON Encoding Helpers ───────────────────────────────────────────────
-
-fn encode_nodes(nodes: Dict(String, Node)) -> String {
-  // Serialize nodes dict to JSON
-  // In production, use gleam_json.encode
-  "{}"
+/// List all flow instances.
+pub fn list_flow_instances(
+  conn: DbConnection,
+) -> Result(List(FlowInstance), DbError) {
+  let sql =
+    "SELECT "
+    <> flow_instance_columns_sql()
+    <> " FROM flow_instances ORDER BY created_at DESC"
+  use rows <- result.try(connection.query(conn, sql, []))
+  list.map(rows, row_to_instance) |> result.all
 }
 
-fn encode_transitions(transitions: List(Transition)) -> String {
-  // Serialize transitions list to JSON
-  // In production, use gleam_json.encode
-  "[]"
+fn flow_instance_columns_sql() -> String {
+  string_join(flow_instance_columns, ", ")
 }
 
-fn row_to_template(row: List(libsql_gleam.Value)) -> Result(FlowTemplate, DbError) {
+// ─── Row Mapping ─────────────────────────────────────────────────────────
+
+/// Decode a row of `flow_template_columns` (in column order) into a
+/// `FlowTemplate`.
+pub fn row_to_flow_template(
+  row: List(connection.Value),
+) -> Result(FlowTemplate, DbError) {
   case row {
     [
-      libsql_gleam.TextVal(id),
-      libsql_gleam.TextVal(name),
-      libsql_gleam.TextVal(description),
-      libsql_gleam.TextVal(initial_node_id),
-      libsql_gleam.TextVal(nodes_json),
-      libsql_gleam.TextVal(transitions_json),
+      connection.TextVal(id),
+      connection.TextVal(name),
+      connection.TextVal(description),
+      connection.TextVal(initial_node_id),
+      connection.TextVal(nodes_json),
+      connection.TextVal(transitions_json),
       on_done_raw,
       on_reject_raw,
-      libsql_gleam.IntVal(_created_at),
-      libsql_gleam.IntVal(_updated_at),
+      connection.IntVal(_created_at),
+      connection.IntVal(_updated_at),
     ] -> {
-      // Parse nodes_json and transitions_json from JSON
-      let nodes = decode_nodes(nodes_json)
-      let transitions = decode_transitions(transitions_json)
+      use nodes <- result.try(
+        codec.decode_nodes(nodes_json)
+        |> result.map_error(fn(e) { connection.QueryError(e) }),
+      )
+      use transitions <- result.try(
+        codec.decode_transitions(transitions_json)
+        |> result.map_error(fn(e) { connection.QueryError(e) }),
+      )
 
       Ok(FlowTemplate(
         id: id,
@@ -200,21 +283,32 @@ fn row_to_template(row: List(libsql_gleam.Value)) -> Result(FlowTemplate, DbErro
   }
 }
 
-fn row_to_instance(row: List(libsql_gleam.Value)) -> Result(FlowInstance, DbError) {
+/// Decode a row of `flow_instance_columns` (in column order) into a
+/// `FlowInstance`. Exported so `db/executions` can hydrate execution states
+/// from the joined `execution_states ⨝ flow_instances` row.
+pub fn row_to_flow_instance(
+  row: List(connection.Value),
+) -> Result(FlowInstance, DbError) {
   case row {
     [
-      libsql_gleam.TextVal(id),
-      libsql_gleam.TextVal(template_id),
-      libsql_gleam.TextVal(task_id),
-      libsql_gleam.TextVal(initial_node_id),
-      libsql_gleam.TextVal(nodes_json),
-      libsql_gleam.TextVal(transitions_json),
+      connection.TextVal(id),
+      connection.TextVal(template_id),
+      connection.TextVal(task_id),
+      connection.TextVal(initial_node_id),
+      connection.TextVal(nodes_json),
+      connection.TextVal(transitions_json),
       on_done_raw,
       on_reject_raw,
-      libsql_gleam.IntVal(_created_at),
+      connection.IntVal(_created_at),
     ] -> {
-      let nodes = decode_nodes(nodes_json)
-      let transitions = decode_transitions(transitions_json)
+      use nodes <- result.try(
+        codec.decode_nodes(nodes_json)
+        |> result.map_error(fn(e) { connection.QueryError(e) }),
+      )
+      use transitions <- result.try(
+        codec.decode_transitions(transitions_json)
+        |> result.map_error(fn(e) { connection.QueryError(e) }),
+      )
 
       Ok(FlowInstance(
         id: id,
@@ -231,28 +325,37 @@ fn row_to_instance(row: List(libsql_gleam.Value)) -> Result(FlowInstance, DbErro
   }
 }
 
-fn decode_nodes(json_str: String) -> Dict(String, Node) {
-  // Parse JSON back to nodes dict
-  // In production, use gleam_json to decode
-  dict.new()
+// ─── Small helpers ───────────────────────────────────────────────────────
+
+fn row_to_template(
+  row: List(connection.Value),
+) -> Result(FlowTemplate, DbError) {
+  row_to_flow_template(row)
 }
 
-fn decode_transitions(json_str: String) -> List(Transition) {
-  // Parse JSON back to transitions list
-  // In production, use gleam_json to decode
-  []
+fn row_to_instance(
+  row: List(connection.Value),
+) -> Result(FlowInstance, DbError) {
+  row_to_flow_instance(row)
 }
 
-fn option_to_text(opt: Option(String)) -> libsql_gleam.Value {
-  case opt {
-    Some(v) -> libsql_gleam.TextVal(v)
-    None -> libsql_gleam.NullVal
+fn count_from_row(row: List(connection.Value)) -> Int {
+  case row {
+    [connection.IntVal(count), ..] -> count
+    _ -> 0
   }
 }
 
-fn text_option(val: libsql_gleam.Value) -> Option(String) {
+fn option_to_text(opt: Option(String)) -> connection.Value {
+  case opt {
+    Some(v) -> connection.TextVal(v)
+    None -> connection.NullVal
+  }
+}
+
+fn text_option(val: connection.Value) -> Option(String) {
   case val {
-    libsql_gleam.TextVal(v) -> Some(v)
+    connection.TextVal(v) -> Some(v)
     _ -> None
   }
 }

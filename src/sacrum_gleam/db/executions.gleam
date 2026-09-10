@@ -1,14 +1,88 @@
-import gleam/dict.{Dict}
-import gleam/option.{Option, Some, None}
-import libsql_gleam
-import sacrum_gleam/db/connection.{DbConnection, DbError}
+import gleam/dict.{type Dict}
+import gleam/dynamic/decode
+import gleam/json
+import gleam/list
+import gleam/option.{type Option, None, Some}
+import gleam/result
+import gleam/string
+import sacrum_gleam/db/connection.{type DbConnection, type DbError, type Value}
+import sacrum_gleam/db/flows
 import sacrum_gleam/domain/execution.{
-  ExecutionState, ExecutionStatus, StepExecution, StepStatus,
-  execution_status_to_string, step_status_to_string,
+  type ExecutionState, type ExecutionStatus, type StepExecution, type StepStatus,
+  AwaitingInput, Cancelled, Completed, ExecutionState, Failed, Pending, Rejected,
+  Running, StepCancelled, StepCompleted, StepEntered, StepExecution, StepFailed,
+  StepInProgress, StepPending, execution_status_to_string, step_status_to_string,
 }
-import sacrum_gleam/domain/flow.{FlowInstance}
 
 /// Execution state and step execution persistence.
+/// Execution state columns (aliased to `es`) joined with the flow instance
+/// columns (`fi`). The state part comes first so `row_to_execution_state` can
+/// split the joined row at a fixed boundary and decode each half against its
+/// own pinned column list.
+const execution_state_columns = [
+  "es.id",
+  "es.flow_instance_id",
+  "es.task_id",
+  "es.status",
+  "es.current_node_id",
+  "es.loop_counters_json",
+  "es.variables_json",
+  "es.parallel_active_json",
+  "es.started_at",
+  "es.completed_at",
+  "es.created_at",
+  "es.updated_at",
+]
+
+const flow_instance_columns = [
+  "fi.id",
+  "fi.template_id",
+  "fi.task_id",
+  "fi.initial_node_id",
+  "fi.nodes_json",
+  "fi.transitions_json",
+  "fi.on_done_template_id",
+  "fi.on_reject_template_id",
+  "fi.created_at",
+]
+
+/// Explicit column list for the step_executions table (matches schema order).
+const step_columns = [
+  "id",
+  "flow_instance_id",
+  "execution_state_id",
+  "node_id",
+  "task_id",
+  "status",
+  "prompt",
+  "output",
+  "transition_result",
+  "model",
+  "input_tokens",
+  "output_tokens",
+  "cost",
+  "duration_ms",
+  "session_id",
+  "created_at",
+  "completed_at",
+]
+
+fn joined_columns_sql() -> String {
+  string.join(execution_state_columns, ", ")
+  <> ", "
+  <> string.join(flow_instance_columns, ", ")
+}
+
+fn execution_states_sql() -> String {
+  "SELECT "
+  <> joined_columns_sql()
+  <> " FROM execution_states es "
+  <> "JOIN flow_instances fi ON fi.id = es.flow_instance_id"
+}
+
+fn step_columns_sql() -> String {
+  string.join(step_columns, ", ")
+}
 
 // ─── Execution States ────────────────────────────────────────────────────
 
@@ -26,21 +100,21 @@ pub fn create_execution_state(
   }
 
   let params = [
-    libsql_gleam.TextVal(state.id),
-    libsql_gleam.TextVal(state.flow_instance.id),
-    libsql_gleam.TextVal(state.task_id),
-    libsql_gleam.TextVal(execution_status_to_string(state.status)),
+    connection.TextVal(state.id),
+    connection.TextVal(state.flow_instance.id),
+    connection.TextVal(state.task_id),
+    connection.TextVal(execution_status_to_string(state.status)),
     option_to_text(state.current_node_id),
-    libsql_gleam.TextVal("{}"),
-    libsql_gleam.TextVal("{}"),
-    libsql_gleam.TextVal("[]"),
+    connection.TextVal(encode_loop_counters(state.loop_counters)),
+    connection.TextVal(encode_variables(state.variables)),
+    connection.TextVal(encode_parallel_active(state.parallel_active)),
     int_option_to_val(state.started_at),
     int_option_to_val(state.completed_at),
-    libsql_gleam.IntVal(now),
-    libsql_gleam.IntVal(now),
+    connection.IntVal(now),
+    connection.IntVal(now),
   ]
 
-  use _ <- connection.query(conn, sql, params)
+  use _ <- result.try(connection.execute(conn, sql, params))
   Ok(state.id)
 }
 
@@ -48,8 +122,24 @@ pub fn get_execution_state(
   conn: DbConnection,
   id: String,
 ) -> Result(ExecutionState, DbError) {
-  let sql = "SELECT * FROM execution_states WHERE id = ?"
-  use row <- connection.query_one(conn, sql, [libsql_gleam.TextVal(id)])
+  let sql = execution_states_sql() <> " WHERE es.id = ?"
+  use row <- result.try(
+    connection.query_one(conn, sql, [connection.TextVal(id)]),
+  )
+  row_to_execution_state(row)
+}
+
+/// Get the execution state for a flow instance (one instance has exactly one
+/// execution state). The API addresses instances by their flow instance id,
+/// so this is the lookup used by the execution control endpoints.
+pub fn get_execution_by_instance(
+  conn: DbConnection,
+  instance_id: String,
+) -> Result(ExecutionState, DbError) {
+  let sql = execution_states_sql() <> " WHERE es.flow_instance_id = ?"
+  use row <- result.try(
+    connection.query_one(conn, sql, [connection.TextVal(instance_id)]),
+  )
   row_to_execution_state(row)
 }
 
@@ -57,18 +147,22 @@ pub fn get_execution_by_task(
   conn: DbConnection,
   task_id: String,
 ) -> Result(List(ExecutionState), DbError) {
-  let sql = "SELECT * FROM execution_states WHERE task_id = ? ORDER BY created_at DESC"
-  use rows <- connection.query(conn, sql, [libsql_gleam.TextVal(task_id)])
+  let sql =
+    execution_states_sql()
+    <> " WHERE es.task_id = ? ORDER BY es.created_at DESC"
+  use rows <- result.try(
+    connection.query(conn, sql, [connection.TextVal(task_id)]),
+  )
   list.map(rows, row_to_execution_state) |> result.all
 }
 
 pub fn get_active_executions(
   conn: DbConnection,
 ) -> Result(List(ExecutionState), DbError) {
-  let sql = {
-    "SELECT * FROM execution_states WHERE status IN ('running', 'awaiting_input')"
-  }
-  use rows <- connection.query(conn, sql, [])
+  let sql =
+    execution_states_sql()
+    <> " WHERE es.status IN ('running', 'awaiting_input')"
+  use rows <- result.try(connection.query(conn, sql, []))
   list.map(rows, row_to_execution_state) |> result.all
 }
 
@@ -85,10 +179,10 @@ pub fn update_execution_status(
   }
 
   let params = [
-    libsql_gleam.TextVal(execution_status_to_string(status)),
+    connection.TextVal(execution_status_to_string(status)),
     option_to_text(current_node_id),
-    libsql_gleam.IntVal(now),
-    libsql_gleam.TextVal(id),
+    connection.IntVal(now),
+    connection.TextVal(id),
   ]
 
   connection.execute(conn, sql, params)
@@ -108,10 +202,10 @@ pub fn update_execution_variables(
   }
 
   let params = [
-    libsql_gleam.TextVal("{}"), // serialized variables
-    libsql_gleam.TextVal("{}"), // serialized loop_counters
-    libsql_gleam.IntVal(now),
-    libsql_gleam.TextVal(id),
+    connection.TextVal(encode_variables(variables)),
+    connection.TextVal(encode_loop_counters(loop_counters)),
+    connection.IntVal(now),
+    connection.TextVal(id),
   ]
 
   connection.execute(conn, sql, params)
@@ -122,7 +216,7 @@ pub fn update_execution_variables(
 pub fn create_step_execution(
   conn: DbConnection,
   step: StepExecution,
-  now: Int,
+  _now: Int,
 ) -> Result(String, DbError) {
   let sql = {
     "INSERT INTO step_executions "
@@ -134,26 +228,26 @@ pub fn create_step_execution(
   }
 
   let params = [
-    libsql_gleam.TextVal(step.id),
-    libsql_gleam.TextVal(step.flow_instance_id),
-    libsql_gleam.TextVal(step.execution_state_id),
-    libsql_gleam.TextVal(step.node_id),
-    libsql_gleam.TextVal(step.task_id),
-    libsql_gleam.TextVal(step_status_to_string(step.status)),
+    connection.TextVal(step.id),
+    connection.TextVal(step.flow_instance_id),
+    connection.TextVal(step.execution_state_id),
+    connection.TextVal(step.node_id),
+    connection.TextVal(step.task_id),
+    connection.TextVal(step_status_to_string(step.status)),
     option_to_text(step.prompt),
     option_to_text(step.output),
     option_to_text(step.transition_result),
     option_to_text(step.model),
-    libsql_gleam.IntVal(step.input_tokens),
-    libsql_gleam.IntVal(step.output_tokens),
-    libsql_gleam.FloatVal(step.cost),
-    libsql_gleam.IntVal(step.duration_ms),
+    connection.IntVal(step.input_tokens),
+    connection.IntVal(step.output_tokens),
+    connection.FloatVal(step.cost),
+    connection.IntVal(step.duration_ms),
     option_to_text(step.session_id),
-    libsql_gleam.IntVal(step.created_at),
+    connection.IntVal(step.created_at),
     int_option_to_val(step.completed_at),
   ]
 
-  use _ <- connection.query(conn, sql, params)
+  use _ <- result.try(connection.execute(conn, sql, params))
   Ok(step.id)
 }
 
@@ -170,17 +264,17 @@ pub fn update_step_execution(
   }
 
   let params = [
-    libsql_gleam.TextVal(step_status_to_string(step.status)),
+    connection.TextVal(step_status_to_string(step.status)),
     option_to_text(step.output),
     option_to_text(step.transition_result),
     option_to_text(step.model),
-    libsql_gleam.IntVal(step.input_tokens),
-    libsql_gleam.IntVal(step.output_tokens),
-    libsql_gleam.FloatVal(step.cost),
-    libsql_gleam.IntVal(step.duration_ms),
+    connection.IntVal(step.input_tokens),
+    connection.IntVal(step.output_tokens),
+    connection.FloatVal(step.cost),
+    connection.IntVal(step.duration_ms),
     option_to_text(step.session_id),
     int_option_to_val(step.completed_at),
-    libsql_gleam.TextVal(step.id),
+    connection.TextVal(step.id),
   ]
 
   connection.execute(conn, sql, params)
@@ -190,8 +284,11 @@ pub fn get_step_execution(
   conn: DbConnection,
   id: String,
 ) -> Result(StepExecution, DbError) {
-  let sql = "SELECT * FROM step_executions WHERE id = ?"
-  use row <- connection.query_one(conn, sql, [libsql_gleam.TextVal(id)])
+  let sql =
+    "SELECT " <> step_columns_sql() <> " FROM step_executions WHERE id = ?"
+  use row <- result.try(
+    connection.query_one(conn, sql, [connection.TextVal(id)]),
+  )
   row_to_step(row)
 }
 
@@ -200,10 +297,14 @@ pub fn get_steps_for_instance(
   instance_id: String,
 ) -> Result(List(StepExecution), DbError) {
   let sql = {
-    "SELECT * FROM step_executions WHERE flow_instance_id = ? "
+    "SELECT "
+    <> step_columns_sql()
+    <> " FROM step_executions WHERE flow_instance_id = ? "
     <> "ORDER BY created_at DESC"
   }
-  use rows <- connection.query(conn, sql, [libsql_gleam.TextVal(instance_id)])
+  use rows <- result.try(
+    connection.query(conn, sql, [connection.TextVal(instance_id)]),
+  )
   list.map(rows, row_to_step) |> result.all
 }
 
@@ -212,72 +313,106 @@ pub fn get_steps_for_task(
   task_id: String,
 ) -> Result(List(StepExecution), DbError) {
   let sql = {
-    "SELECT * FROM step_executions WHERE task_id = ? ORDER BY created_at DESC"
+    "SELECT "
+    <> step_columns_sql()
+    <> " FROM step_executions WHERE task_id = ? ORDER BY created_at DESC"
   }
-  use rows <- connection.query(conn, sql, [libsql_gleam.TextVal(task_id)])
+  use rows <- result.try(
+    connection.query(conn, sql, [connection.TextVal(task_id)]),
+  )
   list.map(rows, row_to_step) |> result.all
 }
 
 // ─── Row Mapping ─────────────────────────────────────────────────────────
 
-fn row_to_execution_state(row: List(libsql_gleam.Value)) -> Result(ExecutionState, DbError) {
-  case row {
+fn row_to_execution_state(row: List(Value)) -> Result(ExecutionState, DbError) {
+  // Split the joined row at the boundary between the execution state columns
+  // (12) and the flow instance columns (9).
+  let #(state_row, instance_row) = list.split(row, at: 12)
+  use instance <- result.try(flows.row_to_flow_instance(instance_row))
+
+  case state_row {
     [
-      libsql_gleam.TextVal(id),
-      libsql_gleam.TextVal(_instance_id),
-      libsql_gleam.TextVal(task_id),
-      libsql_gleam.TextVal(status_str),
+      connection.TextVal(id),
+      connection.TextVal(_flow_instance_id),
+      connection.TextVal(task_id),
+      connection.TextVal(status_str),
       current_node_raw,
-      libsql_gleam.TextVal(_loop_counters_json),
-      libsql_gleam.TextVal(_variables_json),
-      libsql_gleam.TextVal(_parallel_json),
+      connection.TextVal(loop_counters_json),
+      connection.TextVal(variables_json),
+      connection.TextVal(parallel_json),
       started_raw,
       completed_raw,
-      libsql_gleam.IntVal(_created_at),
-      libsql_gleam.IntVal(_updated_at),
+      connection.IntVal(_created_at),
+      connection.IntVal(_updated_at),
     ] -> {
-      use status <- result.map_err(
-        execution_status_from_string(status_str),
-        fn(e) { connection.QueryError(e) },
+      use status <- result.try(
+        execution_status_from_string(status_str)
+        |> result.map_error(fn(message) { connection.QueryError(message) }),
+      )
+      use loop_counters <- result.try(
+        decode_loop_counters(loop_counters_json)
+        |> result.map_error(fn(message) { connection.QueryError(message) }),
+      )
+      use variables <- result.try(
+        decode_variables(variables_json)
+        |> result.map_error(fn(message) { connection.QueryError(message) }),
+      )
+      use parallel_active <- result.try(
+        decode_parallel_active(parallel_json)
+        |> result.map_error(fn(message) { connection.QueryError(message) }),
       )
 
-      // We'd need to load the FlowInstance separately
-      // For now return a placeholder
-      Error(connection.QueryError("ExecutionState requires FlowInstance join"))
+      Ok(ExecutionState(
+        id: id,
+        flow_instance: instance,
+        task_id: task_id,
+        status: status,
+        current_node_id: text_option(current_node_raw),
+        // Step history lives in step_executions; load it separately via
+        // `get_steps_for_instance`.
+        step_history: [],
+        loop_counters: loop_counters,
+        variables: variables,
+        parallel_active: parallel_active,
+        started_at: int_option(started_raw),
+        completed_at: int_option(completed_raw),
+      ))
     }
     _ -> Error(connection.QueryError("Invalid execution state row"))
   }
 }
 
-fn row_to_step(row: List(libsql_gleam.Value)) -> Result(StepExecution, DbError) {
+fn row_to_step(row: List(Value)) -> Result(StepExecution, DbError) {
   case row {
     [
-      libsql_gleam.TextVal(id),
-      libsql_gleam.TextVal(flow_instance_id),
-      libsql_gleam.TextVal(_exec_state_id),
-      libsql_gleam.TextVal(node_id),
-      libsql_gleam.TextVal(task_id),
-      libsql_gleam.TextVal(status_str),
+      connection.TextVal(id),
+      connection.TextVal(flow_instance_id),
+      connection.TextVal(execution_state_id),
+      connection.TextVal(node_id),
+      connection.TextVal(task_id),
+      connection.TextVal(status_str),
       prompt_raw,
       output_raw,
       transition_raw,
       model_raw,
-      libsql_gleam.IntVal(input_tokens),
-      libsql_gleam.IntVal(output_tokens),
-      libsql_gleam.FloatVal(cost),
-      libsql_gleam.IntVal(duration_ms),
+      connection.IntVal(input_tokens),
+      connection.IntVal(output_tokens),
+      connection.FloatVal(cost),
+      connection.IntVal(duration_ms),
       session_raw,
-      libsql_gleam.IntVal(created_at),
+      connection.IntVal(created_at),
       completed_raw,
     ] -> {
-      use status <- result.map_err(
-        step_status_from_string(status_str),
-        fn(e) { connection.QueryError(e) },
+      use status <- result.try(
+        step_status_from_string(status_str)
+        |> result.map_error(fn(message) { connection.QueryError(message) }),
       )
 
       Ok(StepExecution(
         id: id,
         flow_instance_id: flow_instance_id,
+        execution_state_id: execution_state_id,
         node_id: node_id,
         task_id: task_id,
         status: status,
@@ -295,6 +430,73 @@ fn row_to_step(row: List(libsql_gleam.Value)) -> Result(StepExecution, DbError) 
       ))
     }
     _ -> Error(connection.QueryError("Invalid step execution row"))
+  }
+}
+
+// ─── JSON Encoding Helpers ───────────────────────────────────────────────
+
+fn encode_variables(variables: Dict(String, String)) -> String {
+  variables
+  |> dict.to_list
+  |> list.map(fn(pair) {
+    let #(key, value) = pair
+    #(key, json.string(value))
+  })
+  |> json.object
+  |> json.to_string
+}
+
+fn encode_loop_counters(loop_counters: Dict(String, Int)) -> String {
+  loop_counters
+  |> dict.to_list
+  |> list.map(fn(pair) {
+    let #(key, count) = pair
+    #(key, json.int(count))
+  })
+  |> json.object
+  |> json.to_string
+}
+
+fn encode_parallel_active(active: List(String)) -> String {
+  active
+  |> json.array(json.string)
+  |> json.to_string
+}
+
+fn decode_variables(raw: String) -> Result(Dict(String, String), String) {
+  json.parse(raw, decode.dict(decode.string, decode.string))
+  |> result.map_error(executions_error_to_string)
+}
+
+fn decode_loop_counters(raw: String) -> Result(Dict(String, Int), String) {
+  json.parse(raw, decode.dict(decode.string, decode.int))
+  |> result.map_error(executions_error_to_string)
+}
+
+fn decode_parallel_active(raw: String) -> Result(List(String), String) {
+  json.parse(raw, decode.list(decode.string))
+  |> result.map_error(executions_error_to_string)
+}
+
+fn executions_error_to_string(error: json.DecodeError) -> String {
+  case error {
+    json.UnexpectedEndOfInput -> "Unexpected end of JSON input"
+    json.UnexpectedByte(byte) -> "Unexpected byte: " <> byte
+    json.UnexpectedSequence(sequence) -> "Unexpected sequence: " <> sequence
+    json.UnableToDecode(errors) ->
+      errors
+      |> list.map(fn(decode_error) {
+        case decode_error {
+          decode.DecodeError(expected: expected, found: found, path: path) ->
+            "expected "
+            <> expected
+            <> ", found "
+            <> found
+            <> " at "
+            <> string.join(path, ".")
+        }
+      })
+      |> string.join("; ")
   }
 }
 
@@ -323,30 +525,30 @@ fn step_status_from_string(s: String) -> Result(StepStatus, String) {
   }
 }
 
-fn option_to_text(opt: Option(String)) -> libsql_gleam.Value {
+fn option_to_text(opt: Option(String)) -> Value {
   case opt {
-    Some(v) -> libsql_gleam.TextVal(v)
-    None -> libsql_gleam.NullVal
+    Some(v) -> connection.TextVal(v)
+    None -> connection.NullVal
   }
 }
 
-fn int_option_to_val(opt: Option(Int)) -> libsql_gleam.Value {
+fn int_option_to_val(opt: Option(Int)) -> Value {
   case opt {
-    Some(v) -> libsql_gleam.IntVal(v)
-    None -> libsql_gleam.NullVal
+    Some(v) -> connection.IntVal(v)
+    None -> connection.NullVal
   }
 }
 
-fn int_option(val: libsql_gleam.Value) -> Option(Int) {
+fn int_option(val: Value) -> Option(Int) {
   case val {
-    libsql_gleam.IntVal(v) -> Some(v)
+    connection.IntVal(v) -> Some(v)
     _ -> None
   }
 }
 
-fn text_option(val: libsql_gleam.Value) -> Option(String) {
+fn text_option(val: Value) -> Option(String) {
   case val {
-    libsql_gleam.TextVal(v) -> Some(v)
+    connection.TextVal(v) -> Some(v)
     _ -> None
   }
 }

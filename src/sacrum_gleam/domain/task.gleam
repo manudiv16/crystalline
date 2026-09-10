@@ -1,5 +1,4 @@
-import gleam/option.{Option, Some, None}
-import gleam/result
+import gleam/option.{type Option, None}
 
 pub type Level {
   Epic
@@ -54,11 +53,7 @@ pub type Task {
   )
 }
 
-pub fn new_task(
-  title: String,
-  level: Level,
-  priority: Priority,
-) -> Task {
+pub fn new_task(title: String, level: Level, priority: Priority) -> Task {
   Task(
     id: "",
     short_id: "",

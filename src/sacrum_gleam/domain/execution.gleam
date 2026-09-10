@@ -1,6 +1,6 @@
-import gleam/dict.{Dict}
-import gleam/option.{Option, None}
-import sacrum_gleam/domain/flow.{FlowInstance, Node}
+import gleam/dict.{type Dict}
+import gleam/option.{type Option, None}
+import sacrum_gleam/domain/flow.{type FlowInstance}
 
 /// Execution state for a FlowInstance running against a Task.
 ///
@@ -11,7 +11,6 @@ import sacrum_gleam/domain/flow.{FlowInstance, Node}
 /// - step_history: ordered log of every step execution
 /// - loop_counters: track iteration counts per loop node
 /// - variables: runtime variable store for condition evaluation
-
 pub type ExecutionStatus {
   /// Flow hasn't started yet
   Pending
@@ -37,6 +36,7 @@ pub type StepStatus {
   StepFailed
   StepCancelled
 }
+
 pub type StepExecution {
   StepExecution(
     id: String,

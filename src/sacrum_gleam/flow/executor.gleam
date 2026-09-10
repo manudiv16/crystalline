@@ -1,13 +1,14 @@
-import gleam/dict
-import gleam/option.{Option, Some, None}
+import gleam/dict.{type Dict}
+import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/result
-import sacrum_gleam/domain/flow.{
-  FlowInstance, Node, NodeType, Transition,
-}
+import gleam/string
 import sacrum_gleam/domain/execution.{
-  ExecutionState, ExecutionStatus, StepExecution, StepStatus,
+  type ExecutionState, type ExecutionStatus, type StepExecution, AwaitingInput,
+  Completed, ExecutionState, Running, StepCompleted, StepExecution,
   new_execution_state,
 }
+import sacrum_gleam/domain/flow.{type BranchRule, type FlowInstance, type Node}
 
 /// The flow executor drives a FlowInstance through its nodes.
 ///
@@ -30,7 +31,6 @@ import sacrum_gleam/domain/execution.{
 /// The executor is pure-functional: it takes a state and returns a new state
 /// plus an action to perform. The caller (daemon/Tauri) executes the action
 /// and feeds the result back.
-
 pub type Action {
   /// Execute an agent step with this prompt/config
   RunStep(node: Node, prompt: String)
@@ -47,10 +47,7 @@ pub type Action {
 }
 
 pub type ExecuteResult {
-  ExecuteResult(
-    state: ExecutionState,
-    action: Action,
-  )
+  ExecuteResult(state: ExecutionState, action: Action)
 }
 
 /// Start executing a flow from its initial node.
@@ -96,16 +93,16 @@ pub fn complete_step(
 
   case dict.get(state.flow_instance.nodes, completed_node_id) {
     Error(Nil) ->
-      ExecuteResult(state, ExecutionError("Node not found: " <> completed_node_id))
+      ExecuteResult(
+        state,
+        ExecutionError("Node not found: " <> completed_node_id),
+      )
     Ok(completed_node) -> find_next_node(state, completed_node)
   }
 }
 
 /// Provide human input to resume from an AwaitingInput state.
-pub fn provide_input(
-  state: ExecutionState,
-  input: String,
-) -> ExecuteResult {
+pub fn provide_input(state: ExecutionState, input: String) -> ExecuteResult {
   let state = state |> set_status(Running)
 
   let assert Some(node_id) = state.current_node_id
@@ -152,10 +149,7 @@ fn parse_equality(expr: String) -> Option(#(String, String)) {
 
 // ─── Node Type Dispatch ─────────────────────────────────────────────────
 
-fn dispatch_node(
-  state: ExecutionState,
-  node: Node,
-) -> ExecuteResult {
+fn dispatch_node(state: ExecutionState, node: Node) -> ExecuteResult {
   case node.node_type {
     flow.Step -> execute_step(state, node)
     flow.Sequence -> execute_sequence(state, node)
@@ -167,11 +161,10 @@ fn dispatch_node(
 }
 
 fn execute_step(state: ExecutionState, node: Node) -> ExecuteResult {
-  let prompt =
-    case node.prompt {
-      Some(p) -> p
-      None -> node.goal
-    }
+  let prompt = case node.prompt {
+    Some(p) -> p
+    None -> node.goal
+  }
 
   let state = state |> set_current_node(node.id)
   ExecuteResult(state, RunStep(node, prompt))
@@ -202,13 +195,14 @@ fn execute_sequence(state: ExecutionState, node: Node) -> ExecuteResult {
 fn execute_branch(state: ExecutionState, node: Node) -> ExecuteResult {
   // Evaluate branch rules in order, first match wins
   case find_matching_rule(node.branch_rules, state.variables) {
-    Some(rule) -> {
-      let state = state
+    Ok(rule) -> {
+      let state =
+        state
         |> set_current_node(rule.target_id)
         |> set_variable("_last_branch", rule.target_id)
       dispatch_for_node(state, rule.target_id)
     }
-    None -> {
+    Error(Nil) -> {
       // No condition matched — follow default transition or next node
       find_next_node(state, node)
     }
@@ -216,49 +210,48 @@ fn execute_branch(state: ExecutionState, node: Node) -> ExecuteResult {
 }
 
 fn execute_loop(state: ExecutionState, node: Node) -> ExecuteResult {
-  let loop_config =
-    case node.loop_config {
-      Some(c) -> c
-      None -> {
-        let state = state |> set_current_node(node.id)
-        return ExecuteResult(state, ExecutionError(
-          "Loop node missing loop_config: " <> node.id,
-        ))
-      }
+  case node.loop_config {
+    None -> {
+      let state = state |> set_current_node(node.id)
+      ExecuteResult(
+        state,
+        ExecutionError("Loop node missing loop_config: " <> node.id),
+      )
     }
+    Some(loop_config) -> {
+      let iteration = dict.get(state.loop_counters, node.id) |> result.unwrap(0)
 
-  let iteration =
-    dict.get(state.loop_counters, node.id) |> result.unwrap(0)
-
-  // Check max iterations
-  case loop_config.max_iterations {
-    Some(max) if iteration >= max -> {
-      // Loop exhausted — exit
-      find_next_node(state, node)
-    }
-    _ -> {
-      // Check exit condition
-      let should_exit =
-        case loop_config.exit_condition {
-          Some(cond) -> eval_condition(cond, state.variables)
-          None -> False
+      // Check max iterations
+      case loop_config.max_iterations {
+        Some(max) if iteration >= max -> {
+          // Loop exhausted — exit
+          find_next_node(state, node)
         }
+        _ -> {
+          // Check exit condition
+          let should_exit = case loop_config.exit_condition {
+            Some(cond) -> eval_condition(cond, state.variables)
+            None -> False
+          }
 
-      case should_exit {
-        True -> find_next_node(state, node)
-        False -> {
-          // Execute first child of loop
-          let state =
-            state
-            |> increment_loop_counter(node.id)
-            |> set_current_node(node.id)
+          case should_exit {
+            True -> find_next_node(state, node)
+            False -> {
+              // Execute first child of loop
+              let state =
+                state
+                |> increment_loop_counter(node.id)
+                |> set_current_node(node.id)
 
-          case loop_config.child_ids {
-            [] ->
-              ExecuteResult(state, ExecutionError(
-                "Loop has no children: " <> node.id,
-              ))
-            [first, ..] -> dispatch_for_node(state, first)
+              case loop_config.child_ids {
+                [] ->
+                  ExecuteResult(
+                    state,
+                    ExecutionError("Loop has no children: " <> node.id),
+                  )
+                [first, ..] -> dispatch_for_node(state, first)
+              }
+            }
           }
         }
       }
@@ -274,9 +267,7 @@ fn execute_parallel(state: ExecutionState, node: Node) -> ExecuteResult {
     children -> {
       let child_nodes =
         children
-        |> list.filter_map(fn(cid) {
-          dict.get(state.flow_instance.nodes, cid)
-        })
+        |> list.filter_map(fn(cid) { dict.get(state.flow_instance.nodes, cid) })
 
       let state = state |> set_parallel_active(children)
       ExecuteResult(state, RunParallel(child_nodes))
@@ -308,32 +299,36 @@ fn find_next_node(
     |> list.find(fn(t) {
       case t.condition {
         Some(cond) -> eval_condition(cond, state.variables)
-        None -> True // unconditional transition
+        None -> True
+        // unconditional transition
       }
     })
 
   case matching_transition {
-    Some(t) -> {
+    Ok(t) -> {
       // Check if this leads to flow completion
       case dict.get(instance.nodes, t.to_id) {
         Error(Nil) -> {
           // No such node — flow complete
-          let state = state
+          let state =
+            state
             |> set_status(Completed)
             |> set_completed_at
           ExecuteResult(state, FlowComplete)
         }
-        Ok(next_node) -> dispatch_for_node(state, t.to_id)
+        Ok(_next_node) -> dispatch_for_node(state, t.to_id)
       }
     }
-    None -> {
+    Error(Nil) -> {
       // 2. No transition — check if this was the last node in a composite
       //    or if we should complete the flow
-      case completed_node.id == instance.initial_node_id
-        && list.length(instance.transitions) == 0
+      case
+        completed_node.id == instance.initial_node_id
+        && instance.transitions == []
       {
         True -> {
-          let state = state
+          let state =
+            state
             |> set_status(Completed)
             |> set_completed_at
           ExecuteResult(state, FlowComplete)
@@ -356,17 +351,15 @@ fn find_sibling_or_complete(
     state.flow_instance.nodes
     |> dict.values
     |> list.filter(fn(n) {
-      list.contains(
-        [flow.Sequence, flow.Parallel],
-        n.node_type,
-      )
+      list.contains([flow.Sequence, flow.Parallel], n.node_type)
       && list.contains(n.child_ids, completed_node.id)
     })
 
   case composites {
     [] -> {
       // Not in a composite — check if flow is done
-      let state = state
+      let state =
+        state
         |> set_status(Completed)
         |> set_completed_at
       ExecuteResult(state, FlowComplete)
@@ -375,8 +368,7 @@ fn find_sibling_or_complete(
       // Find next sibling
       let idx =
         parent.child_ids
-        |> list.index_where(fn(cid) { cid == completed_node.id })
-        |> result.unwrap(0)
+        |> index_of(completed_node.id)
 
       case list.drop(parent.child_ids, idx + 1) {
         [] -> {
@@ -389,31 +381,25 @@ fn find_sibling_or_complete(
   }
 }
 
-fn dispatch_for_node(
-  state: ExecutionState,
-  node_id: String,
-) -> ExecuteResult {
+fn dispatch_for_node(state: ExecutionState, node_id: String) -> ExecuteResult {
   case dict.get(state.flow_instance.nodes, node_id) {
     Error(Nil) -> {
       ExecuteResult(state, ExecutionError("Node not found: " <> node_id))
     }
-    Ok(node) -> dispatch_node(
-      state |> set_current_node(node_id),
-      node,
-    )
+    Ok(node) -> dispatch_node(state |> set_current_node(node_id), node)
   }
 }
 
 // ─── State Helpers ──────────────────────────────────────────────────────
 
-fn set_status(state: ExecutionState, status: ExecutionStatus) -> ExecutionState {
+fn set_status(
+  state: ExecutionState,
+  status: ExecutionStatus,
+) -> ExecutionState {
   ExecutionState(..state, status: status)
 }
 
-fn set_current_node(
-  state: ExecutionState,
-  node_id: String,
-) -> ExecutionState {
+fn set_current_node(state: ExecutionState, node_id: String) -> ExecutionState {
   ExecutionState(..state, current_node_id: Some(node_id))
 }
 
@@ -484,4 +470,24 @@ fn set_step_output(step: StepExecution, output: String) -> StepExecution {
 
 fn set_step_completed(step: StepExecution) -> StepExecution {
   StepExecution(..step, status: StepCompleted)
+}
+
+/// Find the first branch rule whose condition evaluates to true.
+fn find_matching_rule(
+  rules: List(BranchRule),
+  variables: Dict(String, String),
+) -> Result(BranchRule, Nil) {
+  list.find(rules, fn(rule) { eval_condition(rule.condition, variables) })
+}
+
+/// Return the zero-based index of the first occurrence of `target`, or 0.
+fn index_of(items: List(String), target: String) -> Int {
+  case
+    items
+    |> list.index_map(fn(item, i) { #(item, i) })
+    |> list.find(fn(pair) { pair.0 == target })
+  {
+    Ok(#(_, i)) -> i
+    Error(Nil) -> 0
+  }
 }

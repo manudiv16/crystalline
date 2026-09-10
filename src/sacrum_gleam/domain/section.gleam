@@ -1,4 +1,4 @@
-import gleam/option.{Option}
+import gleam/option.{type Option}
 
 pub type SectionType {
   Goal
