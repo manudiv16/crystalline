@@ -70,7 +70,22 @@ pub fn advance(state: ExecutionState) -> ExecuteResult {
   case dict.get(state.flow_instance.nodes, node_id) {
     Error(Nil) ->
       ExecuteResult(state, ExecutionError("Node not found: " <> node_id))
-    Ok(node) -> dispatch_node(state, node)
+    Ok(node) -> {
+      let result = dispatch_node(state, node)
+
+      // `advance` is what parks an execution on a human-input node. A step
+      // that has just been completed reports the waiting node's action via
+      // `complete_step`, but the caller is not waiting yet, so the status is
+      // only flipped here.
+      case result.action {
+        AwaitInput(_) ->
+          ExecuteResult(
+            ExecutionState(..result.state, status: AwaitingInput),
+            result.action,
+          )
+        _ -> result
+      }
+    }
   }
 }
 
@@ -276,12 +291,9 @@ fn execute_parallel(state: ExecutionState, node: Node) -> ExecuteResult {
 }
 
 fn execute_human_input(state: ExecutionState, node: Node) -> ExecuteResult {
-  let state =
-    state
-    |> set_current_node(node.id)
-    |> set_status(AwaitingInput)
-
-  ExecuteResult(state, AwaitInput(node))
+  // The status flip to `AwaitingInput` happens in `advance`, not here, so
+  // that `complete_step` can report the pending action without parking.
+  ExecuteResult(state |> set_current_node(node.id), AwaitInput(node))
 }
 
 // ─── Next Node Resolution ───────────────────────────────────────────────

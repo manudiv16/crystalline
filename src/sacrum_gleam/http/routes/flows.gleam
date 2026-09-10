@@ -342,7 +342,10 @@ fn reject(
       case reject_service(conn, instance_id) {
         Error(error) -> execution_error_response(error)
         Ok(state) ->
-          helpers.json_response(json.to_string(execution_body(state)), 200)
+          helpers.json_response(
+            json.to_string(execution_step_body(state, FlowReject)),
+            200,
+          )
       }
   }
 }
@@ -554,7 +557,11 @@ pub fn advance_service(
 
   let #(new_state, action) = case state.status {
     Pending -> {
-      let started = executor_start(state.flow_instance, state.task_id)
+      // `executor_start` builds a fresh state; keep the identity of the
+      // persisted row so the update below targets the right execution.
+      let started =
+        executor_start(state.flow_instance, state.task_id)
+        |> preserve_persisted(state)
       let result = executor_advance(started)
       #(result.state, result.action)
     }
@@ -566,6 +573,21 @@ pub fn advance_service(
 
   use _ <- result.try(persist_state(conn, new_state))
   Ok(#(new_state, action))
+}
+
+/// Copy the persisted identity and runtime stores onto a freshly built state.
+fn preserve_persisted(
+  fresh: ExecutionState,
+  persisted: ExecutionState,
+) -> ExecutionState {
+  ExecutionState(
+    ..fresh,
+    id: persisted.id,
+    step_history: persisted.step_history,
+    variables: persisted.variables,
+    loop_counters: persisted.loop_counters,
+    parallel_active: persisted.parallel_active,
+  )
 }
 
 /// Report the output of the currently running step and obtain the next

@@ -109,7 +109,9 @@ remote database and roll schema changes out from a single instance first.
 ### Negative
 
 - **Young ecosystem**: fewer libraries than Rust/Elixir
-- **libsql_gleam**: unofficial NIF, depends on external maintenance
+- **libsql_gleam**: unofficial NIF, depends on external maintenance (the
+  0.1.0 release cannot load its NIF on OTP 26+, so it is vendored under
+  `vendor/libsql_gleam/` with a patched loader — see README "Development")
 - **JSON**: no mature library (gleam_json incompatible with stdlib v1)
 - **Learning curve**: Gleam is less known than Rust/Elixir
 

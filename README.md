@@ -163,8 +163,20 @@ gleam build # Compile
 > **libsql NIF.** The `libsql_gleam` hex package does not ship a compiled NIF
 > and its upstream release download is a placeholder, so the Rust NIF is built
 > from source via `scripts/build-libsql-nif.sh` (pinned to a known-good
-> upstream commit) and installed into Erlang's user cache where the FFI loads
-> it. Run it once per machine (CI does it automatically).
+> upstream commit, `4f3d375`) and installed into Erlang's user cache where the
+> FFI loads it. Run it once per machine (CI does it automatically).
+>
+> **Vendored `libsql_gleam`.** The pinned upstream release cannot load that NIF
+> on OTP 26+: `libsql_ffi` asks `code:priv_dir/1` for an application named
+> `libsql` (the OTP app is `libsql_gleam`, so the lookup returns
+> `{error, bad_name}` and `on_load` crashes), and it derives the cache
+> filename from `erlang:system_info(machine)`, which reports `"BEAM"` rather
+> than a CPU architecture. The package is therefore vendored at
+> `vendor/libsql_gleam/` with a patched `src/libsql_ffi.erl` that fixes both
+> (see the patch note at the top of that file) and wired in as a path
+> dependency in `gleam.toml`. The Rust NIF itself is still built from the
+> pinned upstream commit. Re-vendoring from upstream will reintroduce both
+> bugs unless the patch is carried over.
 
 Environment:
 

@@ -1,0 +1,14 @@
+name = "libsql_gleam"
+version = "0.1.0"
+licences = ["Apache-2.0"]
+description = "Use libSQL from Gleam!"
+
+gleam = ">= 1.3.0"
+
+repository = { type = "github", user = "felstormrage", repo = "libsql-gleam" }
+
+[dependencies]
+gleam_stdlib = ">= 1.0.0 and < 2.0.0"
+
+[dev-dependencies]
+gleeunit = ">= 1.0.0 and < 2.0.0"
