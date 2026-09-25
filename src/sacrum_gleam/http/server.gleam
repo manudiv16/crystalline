@@ -26,8 +26,8 @@ import wisp/wisp_mist
 /// bound; the caller is expected to keep the process alive (see
 /// `crystalline.main`), otherwise the server supervision tree is torn down.
 pub fn start(port: Int) -> Nil {
-  let conn = connect_database()
-  let routes = all_routes(conn)
+  let #(conn, db_mode) = connect_database()
+  let routes = all_routes(conn, db_mode)
 
   let handler = fn(request: wisp.Request) -> wisp.Response {
     router.match_route(routes, request)
@@ -50,16 +50,10 @@ pub fn start(port: Int) -> Nil {
 }
 
 /// Complete production route table, shared by the live server and e2e tests.
-pub fn all_routes(conn: connection.DbConnection) -> List(router.Route) {
-  let db_mode = case config.resolve_db_config() {
-    Ok(db_config) -> config.mode_to_string(db_config.mode)
-    Error(error) ->
-      panic as {
-        "Invalid database configuration: "
-        <> config.config_error_to_string(error)
-      }
-  }
-
+pub fn all_routes(
+  conn: connection.DbConnection,
+  db_mode: String,
+) -> List(router.Route) {
   router.health_routes(db_mode)
   |> list.append(tasks.task_routes(conn))
   |> list.append(executions.execution_routes(conn))
@@ -69,7 +63,7 @@ pub fn all_routes(conn: connection.DbConnection) -> List(router.Route) {
 
 /// Resolve the database configuration from the environment, connect, and
 /// apply any pending schema migrations.
-fn connect_database() -> connection.DbConnection {
+fn connect_database() -> #(connection.DbConnection, String) {
   case config.resolve_db_config() {
     Error(error) ->
       panic as {
@@ -85,7 +79,7 @@ fn connect_database() -> connection.DbConnection {
           }
         Ok(conn) ->
           case migrations.run_migrations(conn) {
-            Ok(_) -> conn
+            Ok(_) -> #(conn, config.mode_to_string(cfg.mode))
             Error(error) ->
               panic as {
                 "Migration failed: " <> migrations_error_to_string(error)

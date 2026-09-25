@@ -42,7 +42,7 @@ fn dispatch(
   conn: connection.DbConnection,
   request: wisp.Request,
 ) -> wisp.Response {
-  router.match_route(server.all_routes(conn), request)
+  router.match_route(server.all_routes(conn, "local"), request)
 }
 
 fn get(conn: connection.DbConnection, path: String) -> wisp.Response {
