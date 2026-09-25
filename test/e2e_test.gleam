@@ -1,3 +1,18 @@
+/// Issue 13 acceptance: end-to-end tests for the task → completed flow path.
+///
+/// Every request is dispatched through the production route table
+/// (`server.all_routes/2`) with `wisp/simulate`, following the existing
+/// API-test convention (`tasks_api_test`, `flows_test`): no socket, no network,
+/// no external binary. `server.start/1` mounts exactly that table, so a route
+/// missing from `all_routes` fails here instead of only in production.
+///
+/// Scenario 1 drives `implement_review` to `flow_complete` over HTTP. Scenario 2
+/// drives `design_implement` through `awaiting_input` → `/input` → completion,
+/// pages its session logs over HTTP, and asserts referential integrity after the
+/// flow-instance row is physically deleted (the task DELETE endpoint only
+/// archives, so it cannot exercise the cascade). A stubbed `runtime.Harness`
+/// with a libsql-backed `runtime.Store` covers the adapter leg, so no agent
+/// process is spawned.
 import gleam/dict
 import gleam/dynamic/decode
 import gleam/http
