@@ -5,8 +5,8 @@
 /// `Listening on http://localhost:4920`).
 ///
 /// The server connects to libsql at startup, applies pending migrations and
-/// wires the task, execution and session-log API routes in addition to the
-/// health endpoint.
+/// wires task, execution, flow-template and flow execution APIs in addition to
+/// the health endpoint.
 import envoy
 import gleam/int
 import gleam/list
@@ -16,6 +16,8 @@ import sacrum_gleam/db/connection
 import sacrum_gleam/db/migrations
 import sacrum_gleam/http/router
 import sacrum_gleam/http/routes/executions
+import sacrum_gleam/http/routes/flow_templates
+import sacrum_gleam/http/routes/flows
 import sacrum_gleam/http/routes/tasks
 import wisp
 import wisp/wisp_mist
@@ -24,11 +26,8 @@ import wisp/wisp_mist
 /// bound; the caller is expected to keep the process alive (see
 /// `crystalline.main`), otherwise the server supervision tree is torn down.
 pub fn start(port: Int) -> Nil {
-  let #(conn, db_config) = connect_database()
-  let db_mode = config.mode_to_string(db_config.mode)
-  let routes =
-    list.append(router.health_routes(db_mode), tasks.task_routes(conn))
-    |> list.append(executions.execution_routes(conn))
+  let conn = connect_database()
+  let routes = all_routes(conn)
 
   let handler = fn(request: wisp.Request) -> wisp.Response {
     router.match_route(routes, request)
@@ -50,12 +49,27 @@ pub fn start(port: Int) -> Nil {
   }
 }
 
+/// Complete production route table, shared by the live server and e2e tests.
+pub fn all_routes(conn: connection.DbConnection) -> List(router.Route) {
+  let db_mode = case config.resolve_db_config() {
+    Ok(db_config) -> config.mode_to_string(db_config.mode)
+    Error(error) ->
+      panic as {
+        "Invalid database configuration: "
+        <> config.config_error_to_string(error)
+      }
+  }
+
+  router.health_routes(db_mode)
+  |> list.append(tasks.task_routes(conn))
+  |> list.append(executions.execution_routes(conn))
+  |> list.append(flow_templates.flow_template_routes(conn))
+  |> list.append(flows.flow_routes(conn))
+}
+
 /// Resolve the database configuration from the environment, connect, and
 /// apply any pending schema migrations.
-///
-/// Returns the connection **and** the resolved config so the caller can
-/// report the database mode (local/remote) without echoing the auth token.
-fn connect_database() -> #(connection.DbConnection, config.DbConfig) {
+fn connect_database() -> connection.DbConnection {
   case config.resolve_db_config() {
     Error(error) ->
       panic as {
@@ -71,7 +85,7 @@ fn connect_database() -> #(connection.DbConnection, config.DbConfig) {
           }
         Ok(conn) ->
           case migrations.run_migrations(conn) {
-            Ok(_) -> #(conn, cfg)
+            Ok(_) -> conn
             Error(error) ->
               panic as {
                 "Migration failed: " <> migrations_error_to_string(error)
