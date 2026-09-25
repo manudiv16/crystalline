@@ -15,7 +15,15 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   bugs. Rationale and details: README "Development" and
   `docs/adr/001-embedded-crystalline-gleam-libsql.md`.
 - `gleam format --check src test` reports pre-existing drift in
-  `test/flows_test.gleam` and `test/debug_flows_test.gleam`.
+  `src/sacrum_gleam/http/routes/flows.gleam`, `test/flows_test.gleam` and
+  `test/debug_flows_test.gleam`.
+- The live server and the test suite share one route table,
+  `server.all_routes(conn, db_mode)` (`src/sacrum_gleam/http/server.gleam`).
+  A new HTTP route MUST be added there, not only to its
+  `http/routes/*` module: routes that are missing from the table exist as
+  handlers but 404 on a live server. `test/e2e_test.gleam` drives
+  `implement_review` / `design_implement` to completion through that table, so
+  the omission fails the suite.
 
 ## Maintaining this file
 
