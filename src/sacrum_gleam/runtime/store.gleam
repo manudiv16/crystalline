@@ -4,13 +4,15 @@
 //// database layer and resolves a task worktree before falling back to the
 //// configured project root.
 
-import gleam/option.{Some}
+import gleam/option.{type Option, Some}
 import gleam/result
 import sacrum_gleam/db/connection.{type DbConnection}
 import sacrum_gleam/db/executions
 import sacrum_gleam/db/session_logs
 import sacrum_gleam/db/tasks
-import sacrum_gleam/domain/execution.{type ExecutionState, type StepExecution}
+import sacrum_gleam/domain/execution.{
+  type ExecutionState, type StepExecution, ExecutionState, with_lifecycle,
+}
 import sacrum_gleam/runtime/executor as runtime
 
 /// Build the production store used by the daemon.
@@ -28,7 +30,20 @@ fn save_status(
   state: ExecutionState,
   now: Int,
 ) -> Result(Nil, runtime.RuntimeError) {
-  executions.save_execution_state(conn, state, now)
+  use persisted <- result.try(
+    executions.get_execution_state(conn, state.id)
+    |> result.map_error(persistence_failure),
+  )
+  let state =
+    ExecutionState(
+      ..state,
+      started_at: preserve_timestamp(state.started_at, persisted.started_at),
+      completed_at: preserve_timestamp(
+        state.completed_at,
+        persisted.completed_at,
+      ),
+    )
+  executions.save_execution_state(conn, with_lifecycle(state, now), now)
   |> result.map_error(persistence_failure)
 }
 
@@ -72,4 +87,14 @@ fn workdir(
 
 fn persistence_failure(error: connection.DbError) -> runtime.RuntimeError {
   runtime.PersistenceFailure(connection.error_to_string(error))
+}
+
+fn preserve_timestamp(
+  candidate: Option(Int),
+  saved: Option(Int),
+) -> Option(Int) {
+  case candidate {
+    Some(timestamp) if timestamp > 0 -> Some(timestamp)
+    _ -> saved
+  }
 }

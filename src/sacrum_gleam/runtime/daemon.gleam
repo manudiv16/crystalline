@@ -6,6 +6,8 @@
 
 import envoy
 import gleam/erlang/process
+import gleam/erlang/reference
+import gleam/io
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
@@ -15,8 +17,10 @@ import sacrum_gleam/db/connection.{type DbConnection}
 import sacrum_gleam/db/executions
 import sacrum_gleam/db/flows
 import sacrum_gleam/db/migrations
+import sacrum_gleam/db/session_logs
 import sacrum_gleam/domain/execution.{
-  type ExecutionState, ExecutionState, Pending,
+  type ExecutionState, ExecutionState, Failed, Pending, StepExecution,
+  StepFailed,
 }
 import sacrum_gleam/flow/engine as flow_engine
 import sacrum_gleam/flow/executor as flow_executor
@@ -172,13 +176,33 @@ fn actor_loop(
   case process.receive(subject, within: poll_interval_ms) {
     Ok(Stop) -> connection.close(conn)
     Ok(Tick) -> {
-      let _ = poll_once_as(conn, harness, project_root, owner)
+      poll_and_report(conn, harness, project_root, owner)
       actor_loop(conn, harness, project_root, owner, poll_interval_ms, subject)
     }
     Error(_) -> {
-      let _ = poll_once_as(conn, harness, project_root, owner)
+      poll_and_report(conn, harness, project_root, owner)
       actor_loop(conn, harness, project_root, owner, poll_interval_ms, subject)
     }
+  }
+}
+
+fn poll_and_report(
+  conn: DbConnection,
+  harness: runtime.Harness,
+  project_root: String,
+  owner: String,
+) -> Nil {
+  case poll_once_as(conn, harness, project_root, owner) {
+    Error(error) ->
+      io.println("Background executor poll failed: " <> error_to_string(error))
+    Ok(Processed(instance_id, Error(error))) ->
+      io.println(
+        "Background execution "
+        <> instance_id
+        <> " failed: "
+        <> runtime.error_to_string(error),
+      )
+    Ok(_) -> Nil
   }
 }
 
@@ -216,12 +240,22 @@ fn drive_claimed(
   harness: runtime.Harness,
   project_root: String,
 ) -> Result(ExecutionState, runtime.RuntimeError) {
-  case restore_flow_engine(conn, state) {
+  let run_result = case restore_flow_engine(conn, state) {
     Error(message) -> Error(runtime.GraphError(message))
     Ok(flow) -> {
       let engine =
         runtime.new_engine(flow, harness, store.new_store(), project_root)
       runtime.run_until_wait(conn, engine, state.flow_instance.id)
+    }
+  }
+
+  case run_result {
+    Ok(final_state) -> Ok(final_state)
+    Error(error) -> {
+      case record_failed_claim(conn, state, runtime.error_to_string(error)) {
+        Ok(_) -> Error(error)
+        Error(persistence_error) -> Error(persistence_error)
+      }
     }
   }
 }
@@ -234,12 +268,10 @@ fn restore_flow_engine(
     flows.list_flow_templates(conn)
     |> result.map_error(fn(error) { connection.error_to_string(error) }),
   )
-  use engine <- result.try(
-    list.try_fold(templates, flow_engine.new_engine(), fn(engine, template) {
-      flow_engine.register_template(engine, template)
-      |> result.map_error(string.inspect)
-    }),
-  )
+  let engine =
+    list.fold(templates, flow_engine.new_engine(), fn(engine, template) {
+      flow_engine.restore_template(engine, template)
+    })
 
   let state = case state.status {
     Pending -> {
@@ -257,6 +289,77 @@ fn restore_flow_engine(
   }
 
   Ok(flow_engine.restore_execution(engine, state))
+}
+
+fn record_failed_claim(
+  conn: DbConnection,
+  original_state: ExecutionState,
+  reason: String,
+) -> Result(Nil, runtime.RuntimeError) {
+  let now = runtime.system_time_ms()
+  let production_store = store.new_store()
+  use has_error_log <- result.try(
+    session_logs.has_error_log_for_instance(
+      conn,
+      original_state.flow_instance.id,
+    )
+    |> result.map_error(runtime_persistence_failure),
+  )
+  use latest_state <- result.try(
+    executions.get_execution_by_instance(conn, original_state.flow_instance.id)
+    |> result.map_error(runtime_persistence_failure),
+  )
+  let failed_state =
+    ExecutionState(..latest_state, status: Failed, completed_at: Some(now))
+
+  case has_error_log {
+    True -> production_store.save_status(conn, failed_state, now)
+    False -> {
+      let node_id = case latest_state.current_node_id {
+        Some(id) -> id
+        None -> latest_state.flow_instance.initial_node_id
+      }
+      let step =
+        StepExecution(
+          id: "daemon-error-"
+            <> latest_state.id
+            <> "-"
+            <> string.inspect(reference.new()),
+          flow_instance_id: latest_state.flow_instance.id,
+          execution_state_id: latest_state.id,
+          node_id: node_id,
+          task_id: latest_state.task_id,
+          status: StepFailed,
+          prompt: None,
+          output: Some(reason),
+          transition_result: None,
+          model: None,
+          input_tokens: 0,
+          output_tokens: 0,
+          cost: 0.0,
+          duration_ms: 0,
+          session_id: None,
+          created_at: now,
+          completed_at: Some(now),
+        )
+      use _ <- result.try(production_store.save_step(conn, step, now))
+      use _ <- result.try(production_store.save_status(conn, failed_state, now))
+      production_store.append_log(
+        conn,
+        step.id,
+        latest_state.task_id,
+        "error",
+        reason,
+        now,
+      )
+    }
+  }
+}
+
+fn runtime_persistence_failure(
+  error: connection.DbError,
+) -> runtime.RuntimeError {
+  runtime.PersistenceFailure(connection.error_to_string(error))
 }
 
 fn registry_harness(provider_registry: registry.Registry) -> runtime.Harness {

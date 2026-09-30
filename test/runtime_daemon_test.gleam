@@ -11,6 +11,7 @@ import gleam/erlang/process
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/string
 import gleeunit
 import sacrum_gleam/db/connection.{type DbConnection}
 import sacrum_gleam/db/executions
@@ -25,6 +26,7 @@ import sacrum_gleam/domain/execution.{
 import sacrum_gleam/domain/flow
 import sacrum_gleam/domain/task as task_domain
 import sacrum_gleam/flow/engine as flow_engine
+import sacrum_gleam/flow/templates as prebuilt_templates
 import sacrum_gleam/harness/contract
 import sacrum_gleam/runtime/daemon
 import sacrum_gleam/runtime/executor as runtime
@@ -144,6 +146,66 @@ fn seed_execution(
     )
 
   Fixture(task_id, instance_id, execution_id, node_id)
+}
+
+fn seed_prebuilt_execution(
+  conn: DbConnection,
+  suffix: String,
+  created_at: Int,
+) -> Fixture {
+  let assert Ok(inserted) = prebuilt_templates.seed_to_db(conn, created_at)
+  assert inserted == 6
+  let assert Ok(template) = db_flows.get_flow_template(conn, "implement_review")
+  let task_id = "task-seeded-" <> suffix
+  let instance_id = "instance-seeded-" <> suffix
+  let execution_id = "execution-seeded-" <> suffix
+  let task =
+    task_domain.Task(
+      ..task_domain.new_task(
+        "Seeded task " <> suffix,
+        task_domain.Ticket,
+        task_domain.Medium,
+      ),
+      id: task_id,
+      short_id: "short-seeded-" <> suffix,
+      created_at: created_at,
+      updated_at: created_at,
+    )
+  let assert Ok(_) = db_tasks.create_task(conn, task, created_at)
+  let instance =
+    flow.FlowInstance(
+      id: instance_id,
+      template_id: template.id,
+      task_id: task_id,
+      nodes: template.nodes,
+      transitions: template.transitions,
+      initial_node_id: template.initial_node_id,
+      on_done_template_id: template.on_done_template_id,
+      on_reject_template_id: template.on_reject_template_id,
+    )
+  let assert Ok(_) = db_flows.create_flow_instance(conn, instance, created_at)
+  let state = execution.new_execution_state(instance, task_id)
+  let state = ExecutionState(..state, id: execution_id)
+  let assert Ok(_) = executions.create_execution_state(conn, state, created_at)
+  let assert Ok(_) =
+    db_tasks.update_task(
+      conn,
+      task_id,
+      db_tasks.TaskUpdates(
+        title: None,
+        description: None,
+        priority: None,
+        status: None,
+        tags: None,
+        worktree: None,
+        flow_template_id: Some(template.id),
+        flow_instance_id: Some(instance_id),
+        current_node_id: None,
+      ),
+      created_at,
+    )
+
+  Fixture(task_id, instance_id, execution_id, template.initial_node_id)
 }
 
 fn successful_harness() -> runtime.Harness {
@@ -340,6 +402,131 @@ pub fn daemon_executes_persists_and_does_not_double_run_test() {
   clean_temp_database(database)
 }
 
+pub fn seeded_implement_review_completes_through_daemon_test() {
+  let database = temp_database()
+  let setup_conn = file_connection(database)
+  let assert Ok(_) = migrations.run_migrations(setup_conn)
+  let fixture = seed_prebuilt_execution(setup_conn, "implement-review", 100)
+  let daemon_conn = file_connection(database)
+  let key = "seeded-implement-review-harness"
+  let harness = counting_harness(key)
+
+  let assert Ok(daemon.Processed(instance_id, Ok(final_state))) =
+    daemon.poll_once(daemon_conn, harness, "/project")
+  assert instance_id == fixture.instance_id
+  assert final_state.status == Completed
+  assert call_count(key) == 4
+
+  let assert Ok(steps) =
+    executions.get_steps_for_instance(setup_conn, fixture.instance_id)
+  assert list.length(steps) == 4
+  assert list.sort(list.map(steps, fn(step) { step.node_id }), string.compare)
+    == ["implement", "research", "review", "test"]
+  assert list.all(steps, fn(step) {
+    let metrics_match =
+      step.status == StepCompleted
+      && step.model == Some("stub-model-v1")
+      && step.input_tokens == 41
+      && step.output_tokens == 17
+      && step.cost == 0.025
+      && step.session_id == Some("stub-session")
+    case step.prompt, step.output {
+      Some(prompt), Some(output) ->
+        metrics_match && output == "stub output: " <> prompt
+      _, _ -> False
+    }
+  })
+  assert list.all(steps, fn(step) {
+    case session_logs.list_logs(setup_conn, step.id, 50, None) {
+      Ok(logs) ->
+        list.map(logs, fn(log) { log.sequence }) == [1, 2]
+        && list.map(logs, fn(log) { log.event_type }) == ["outcome", "usage"]
+      Error(_) -> False
+    }
+  })
+
+  let assert Ok(daemon.Idle) =
+    daemon.poll_once(daemon_conn, harness, "/project")
+  assert call_count(key) == 4
+  let assert Ok(persisted) =
+    executions.get_execution_by_instance(setup_conn, fixture.instance_id)
+  assert persisted.status == Completed
+
+  let assert Some(started_at) = persisted.started_at
+  let assert Some(completed_at) = persisted.completed_at
+  assert started_at > 0
+  assert completed_at > 0
+
+  let production_store = store.new_store()
+  let stale_state =
+    ExecutionState(..final_state, started_at: Some(0), completed_at: Some(0))
+  let assert Ok(Nil) =
+    production_store.save_status(daemon_conn, stale_state, completed_at + 100)
+  let assert Ok(persisted_again) =
+    executions.get_execution_by_instance(setup_conn, fixture.instance_id)
+  assert persisted_again.started_at == Some(started_at)
+  assert persisted_again.completed_at == Some(completed_at)
+  let assert Ok([
+    connection.TextVal("completed"),
+    connection.IntVal(row_started_at),
+    connection.IntVal(row_completed_at),
+    connection.NullVal,
+    connection.NullVal,
+  ]) =
+    connection.query_one(
+      setup_conn,
+      "SELECT status, started_at, completed_at, claimed_by, claimed_at "
+        <> "FROM execution_states WHERE id = ?",
+      [connection.TextVal(fixture.execution_id)],
+    )
+  assert row_started_at == started_at
+  assert row_completed_at == completed_at
+
+  connection.close(daemon_conn)
+  connection.close(setup_conn)
+  clean_temp_database(database)
+}
+
+pub fn unrunnable_claim_is_failed_and_logged_test() {
+  let database = temp_database()
+  let setup_conn = file_connection(database)
+  let assert Ok(_) = migrations.run_migrations(setup_conn)
+  let fixture = seed_execution(setup_conn, "unrunnable", 100, None)
+  let assert Ok(_) =
+    connection.execute(
+      setup_conn,
+      "UPDATE flow_templates SET nodes_json = ? WHERE id = ?",
+      [connection.TextVal("{"), connection.TextVal("template-unrunnable")],
+    )
+  let daemon_conn = file_connection(database)
+
+  let assert Ok(daemon.Processed(instance_id, Error(runtime.GraphError(reason)))) =
+    daemon.poll_once(daemon_conn, successful_harness(), "/project")
+  assert instance_id == fixture.instance_id
+
+  let assert Ok(state) =
+    executions.get_execution_by_instance(setup_conn, fixture.instance_id)
+  assert state.status == Failed
+  let assert Ok([failure_step]) =
+    executions.get_steps_for_instance(setup_conn, fixture.instance_id)
+  assert failure_step.status == StepFailed
+  let assert Ok(logs) =
+    session_logs.list_logs(setup_conn, failure_step.id, 50, None)
+  assert list.map(logs, fn(log) { log.sequence }) == [1]
+  assert list.map(logs, fn(log) { log.event_type }) == ["error"]
+  assert list.map(logs, fn(log) { log.payload }) == [reason]
+
+  let assert Ok(daemon.Idle) =
+    daemon.poll_once(daemon_conn, successful_harness(), "/project")
+  let assert Ok(still_failed) =
+    executions.get_execution_by_instance(setup_conn, fixture.instance_id)
+  assert still_failed.status == Failed
+
+  connection.close(daemon_conn)
+  connection.close(setup_conn)
+  clean_temp_database(database)
+}
+
 pub fn failed_harness_is_logged_and_next_poll_still_runs_test() {
   let database = temp_database()
   let setup_conn = file_connection(database)
@@ -434,7 +621,19 @@ pub fn daemon_actor_accepts_tick_and_stops_test() {
   let database = temp_database()
   let setup_conn = file_connection(database)
   let assert Ok(_) = migrations.run_migrations(setup_conn)
-  let fixture = seed_execution(setup_conn, "actor", 100, None)
+  let failed = seed_execution(setup_conn, "actor-failure", 100, None)
+  let succeeding = seed_execution(setup_conn, "actor-next", 200, None)
+  let assert Ok(original_template) =
+    db_flows.get_flow_template(setup_conn, "template-actor-failure")
+  let assert Ok(_) =
+    connection.execute(
+      setup_conn,
+      "UPDATE flow_templates SET nodes_json = ? WHERE id = ?",
+      [
+        connection.TextVal("{"),
+        connection.TextVal("template-actor-failure"),
+      ],
+    )
   let daemon_conn = file_connection(database)
   let assert Ok(actor) =
     daemon.start_with_connection(
@@ -445,10 +644,22 @@ pub fn daemon_actor_accepts_tick_and_stops_test() {
     )
 
   daemon.tick(actor)
-  assert wait_for_status(setup_conn, fixture.instance_id, Completed, 100)
+  assert wait_for_status(setup_conn, failed.instance_id, Failed, 100)
+  assert daemon.is_alive(actor)
+
+  let assert Ok(_) =
+    db_flows.update_flow_template(
+      setup_conn,
+      original_template.id,
+      original_template,
+      300,
+    )
+  daemon.tick(actor)
+  assert wait_for_status(setup_conn, succeeding.instance_id, Completed, 100)
+  assert daemon.is_alive(actor)
+
   daemon.stop(actor)
   assert wait_for_exit(actor, 100)
-
   connection.close(setup_conn)
   clean_temp_database(database)
 }
