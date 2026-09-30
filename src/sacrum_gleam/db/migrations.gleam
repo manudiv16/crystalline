@@ -138,8 +138,18 @@ fn split_statements(sql: String) -> List(String) {
 
 /// The built-in migrations, embedded at compile time.
 pub fn builtin_migrations() -> List(Migration) {
-  [Migration(version: 1, name: "init", sql: init_sql)]
+  [
+    Migration(version: 1, name: "init", sql: init_sql),
+    Migration(version: 2, name: "daemon_claims", sql: daemon_claims_sql),
+  ]
 }
+
+/// SQL from `migrations/0002_daemon_claims.sql`, embedded for runtime use.
+const daemon_claims_sql: String = "-- Migration 0002: daemon execution claims
+ALTER TABLE execution_states ADD COLUMN claimed_by TEXT;
+ALTER TABLE execution_states ADD COLUMN claimed_at INTEGER;
+CREATE INDEX IF NOT EXISTS idx_exec_states_claim
+  ON execution_states(status, claimed_at, created_at);"
 
 /// SQL from `migrations/0001_init.sql`, embedded at compile time.
 const init_sql: String = "-- Migration 0001: Initial schema for embedded Sacrum

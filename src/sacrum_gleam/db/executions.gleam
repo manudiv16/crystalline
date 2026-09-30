@@ -166,6 +166,93 @@ pub fn get_active_executions(
   list.map(rows, row_to_execution_state) |> result.all
 }
 
+/// Persist the complete runtime state after an executor transition.
+pub fn save_execution_state(
+  conn: DbConnection,
+  state: ExecutionState,
+  now: Int,
+) -> Result(Nil, DbError) {
+  let sql = {
+    "UPDATE execution_states SET status = ?, current_node_id = ?, "
+    <> "loop_counters_json = ?, variables_json = ?, "
+    <> "parallel_active_json = ?, started_at = ?, completed_at = ?, "
+    <> "updated_at = ? WHERE id = ?"
+  }
+
+  connection.execute(conn, sql, [
+    connection.TextVal(execution_status_to_string(state.status)),
+    option_to_text(state.current_node_id),
+    connection.TextVal(encode_loop_counters(state.loop_counters)),
+    connection.TextVal(encode_variables(state.variables)),
+    connection.TextVal(encode_parallel_active(state.parallel_active)),
+    int_option_to_val(state.started_at),
+    int_option_to_val(state.completed_at),
+    connection.IntVal(now),
+    connection.TextVal(state.id),
+  ])
+}
+
+/// Atomically claim the oldest pending or running execution whose lease is
+/// absent or expired. A zero-length lease is rejected to preserve exclusivity.
+pub fn claim_execution(
+  conn: DbConnection,
+  owner: String,
+  now: Int,
+  lease_ms: Int,
+) -> Result(Option(ExecutionState), DbError) {
+  case lease_ms > 0 {
+    False -> Error(connection.QueryError("Claim lease must be positive"))
+    True -> {
+      let sql = {
+        "UPDATE execution_states SET claimed_by = ?, claimed_at = ? "
+        <> "WHERE id = (SELECT id FROM execution_states "
+        <> "WHERE status IN ('pending', 'running') "
+        <> "AND (claimed_by IS NULL OR claimed_at IS NULL OR claimed_at <= ?) "
+        <> "ORDER BY created_at, id LIMIT 1) "
+        <> "AND status IN ('pending', 'running') "
+        <> "AND (claimed_by IS NULL OR claimed_at IS NULL OR claimed_at <= ?) "
+        <> "RETURNING id"
+      }
+      let expiry = now - lease_ms
+      use rows <- result.try(
+        connection.query(conn, sql, [
+          connection.TextVal(owner),
+          connection.IntVal(now),
+          connection.IntVal(expiry),
+          connection.IntVal(expiry),
+        ]),
+      )
+
+      case rows {
+        [] -> Ok(None)
+        [[connection.TextVal(id)]] -> {
+          use state <- result.try(get_execution_state(conn, id))
+          use steps <- result.try(get_steps_for_instance(
+            conn,
+            state.flow_instance.id,
+          ))
+          Ok(Some(ExecutionState(..state, step_history: steps)))
+        }
+        _ -> Error(connection.QueryError("Invalid claimed execution row"))
+      }
+    }
+  }
+}
+
+/// Release an execution only when the caller still owns its claim.
+pub fn release_claim(
+  conn: DbConnection,
+  execution_id: String,
+  owner: String,
+) -> Result(Nil, DbError) {
+  connection.execute(
+    conn,
+    "UPDATE execution_states SET claimed_by = NULL, claimed_at = NULL "
+      <> "WHERE id = ? AND claimed_by = ?",
+    [connection.TextVal(execution_id), connection.TextVal(owner)],
+  )
+}
+
 pub fn update_execution_status(
   conn: DbConnection,
   id: String,
