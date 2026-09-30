@@ -13,16 +13,18 @@ import sacrum_gleam/domain/flow.{
 /// 2. initial_node_id references an existing node
 /// 3. All child_ids reference existing nodes
 /// 4. All transition from_id/to_id reference existing nodes
-/// 5. No cycles in the graph (unless through a Loop node)
-/// 6. Branch rules reference valid target nodes
-/// 7. Loop config child_ids reference existing nodes
-/// 8. Step nodes have a prompt
-/// 9. Composite nodes have at least one child
+/// 5. No transition is a self-transition (from_id == to_id)
+/// 6. No cycles in the graph (unless through a Loop node)
+/// 7. Branch rules reference valid target nodes
+/// 8. Loop config child_ids reference existing nodes
+/// 9. Step nodes have a prompt
+/// 10. Composite nodes have at least one child
 pub type ValidationError {
   DuplicateNodeId(id: String)
   MissingInitialNode(id: String)
   MissingChildRef(node_id: String, child_id: String)
   MissingTransitionRef(transition_id: String, node_id: String)
+  SelfTransition(node_id: String)
   CycleDetected(path: List(String))
   MissingBranchTarget(rule: BranchRule)
   StepMissingPrompt(node_id: String)
@@ -98,7 +100,16 @@ fn validate_transitions(
         Ok(_) -> []
         Error(Nil) -> [MissingTransitionRef(t.id, t.to_id)]
       }
-      list.append(missing_from, missing_to)
+      // A transition back to its own source node is rejected for every node
+      // type, Loop included: the executor iterates a Loop through
+      // `loop_config.child_ids` and its iteration counter, and never follows
+      // a self-edge. `find_next_node` would dispatch the same node again on
+      // every completion, so a self-transition can only spin forever.
+      let self_transition = case t.from_id == t.to_id {
+        True -> [SelfTransition(t.from_id)]
+        False -> []
+      }
+      list.flatten([missing_from, missing_to, self_transition])
     })
 
   case errors {

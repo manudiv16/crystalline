@@ -25,6 +25,15 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `implement_review` / `design_implement` to completion through that table, so
   the omission fails the suite.
 
+## Flow graph rules
+
+- `flow/validator.validate` rejects a transition whose `from_id == to_id` for
+  every node type, `Loop` included: the engine iterates a loop through
+  `loop_config.child_ids` plus its iteration counter (`flow/executor.gleam`,
+  `execute_loop`) and never follows a self-edge, so one can only make
+  `find_next_node` re-dispatch the same node forever. Do not re-add a `Loop`
+  exception without changing the executor first.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.

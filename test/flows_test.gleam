@@ -149,6 +149,30 @@ fn transition(id: String, from: String, to: String) -> json.Json {
   ])
 }
 
+/// A loop node with one step child, matching the engine's iteration idiom
+/// (`loop_config.child_ids`, not a self-edge).
+fn loop_node(id: String, child_ids: List(String)) -> json.Json {
+  json.object([
+    #("id", json.string(id)),
+    #("name", json.string(id)),
+    #("node_type", json.string("loop")),
+    #("goal", json.string("loop until done")),
+    #("prompt", json.null()),
+    #("child_ids", json.array(child_ids, json.string)),
+    #("branch_rules", json.preprocessed_array([])),
+    #(
+      "loop_config",
+      json.object([
+        #("max_iterations", json.int(3)),
+        #("exit_condition", json.null()),
+        #("child_ids", json.array(child_ids, json.string)),
+      ]),
+    ),
+    #("agent_config", json.null()),
+    #("output_schema", json.null()),
+  ])
+}
+
 /// Linear flow: step_a → step_b
 fn linear_template(name: String) -> json.Json {
   json.object([
@@ -676,6 +700,89 @@ pub fn invalid_dag_templates_are_rejected_without_persisting_test() {
   assert status(resp) == 400
   assert string.contains(body(resp), "references unknown node: ghost")
   assert count_rows(conn, "SELECT COUNT(*) FROM flow_templates", []) == 0
+}
+
+/// The live validator gap: `step_a → step_b` plus the self-loop `step_b →
+/// step_b` used to be accepted with 201, so an execution would re-dispatch
+/// `step_b` forever. It is now a 400 and nothing is persisted.
+pub fn self_transition_template_is_rejected_without_persisting_test() {
+  let conn = new_conn()
+
+  let self_loop =
+    json.object([
+      #("name", json.string("Self loop")),
+      #("description", json.string("")),
+      #("initial_node_id", json.string("step_a")),
+      #(
+        "nodes",
+        json.preprocessed_array([
+          step_node("step_a", "Do step A"),
+          step_node("step_b", "Do step B"),
+        ]),
+      ),
+      #(
+        "transitions",
+        json.preprocessed_array([
+          transition("t1", "step_a", "step_b"),
+          transition("t2", "step_b", "step_b"),
+        ]),
+      ),
+    ])
+  let resp = post_json(conn, "/api/v1/flow-templates", self_loop)
+  assert status(resp) == 400
+  assert string.contains(body(resp), "self-transition: step_b -> step_b")
+  assert count_rows(conn, "SELECT COUNT(*) FROM flow_templates", []) == 0
+
+  // The same shape on a Loop node is rejected too: loops iterate through
+  // loop_config.child_ids, never through a self-edge.
+  let loop_self_loop =
+    json.object([
+      #("name", json.string("Loop self loop")),
+      #("description", json.string("")),
+      #("initial_node_id", json.string("loop_node")),
+      #(
+        "nodes",
+        json.preprocessed_array([
+          loop_node("loop_node", ["body"]),
+          step_node("body", "Loop body"),
+        ]),
+      ),
+      #(
+        "transitions",
+        json.preprocessed_array([transition("t1", "loop_node", "loop_node")]),
+      ),
+    ])
+  let resp = post_json(conn, "/api/v1/flow-templates", loop_self_loop)
+  assert status(resp) == 400
+  assert string.contains(body(resp), "self-transition: loop_node -> loop_node")
+  assert count_rows(conn, "SELECT COUNT(*) FROM flow_templates", []) == 0
+}
+
+/// The transitions sub-resource re-runs the validator against the full
+/// candidate graph, so a self-loop added after creation is a 400 and the
+/// stored transitions are unchanged.
+pub fn self_transition_added_via_subresource_is_rejected_test() {
+  let conn = new_conn()
+  let template_id = create_template(conn, "Self loop via sub-resource")
+  let transitions_path =
+    "/api/v1/flow-templates/" <> template_id <> "/transitions"
+  let transition_ids = decode.list(string_field("id"))
+
+  let resp =
+    post_json(conn, transitions_path, transition("t2", "step_b", "step_b"))
+  assert status(resp) == 400
+  assert string.contains(body(resp), "self-transition: step_b -> step_b")
+
+  // Re-read the stored row: the rejected transition was not persisted.
+  let assert Ok(ids) =
+    json.parse(body(get(conn, transitions_path)), transition_ids)
+  assert ids == ["t1"]
+  assert count_rows(
+      conn,
+      "SELECT COUNT(*) FROM flow_templates WHERE id = ?",
+      [connection.TextVal(template_id)],
+    )
+    == 1
 }
 
 /// PATCHing a template after instantiation does not rewrite the instance's
