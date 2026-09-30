@@ -189,6 +189,13 @@ pub fn get_execution(
   }
 }
 
+/// Restore a persisted execution state into an engine before resuming it.
+pub fn restore_execution(engine: Engine, state: ExecutionState) -> Engine {
+  let states =
+    dict.insert(engine.executions.states, state.flow_instance.id, state)
+  Engine(..engine, executions: ExecutionRegistry(states))
+}
+
 // ─── Flow Chaining ──────────────────────────────────────────────────────
 
 /// When a flow completes, check if it chains to another flow.

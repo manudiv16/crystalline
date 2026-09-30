@@ -210,6 +210,10 @@ gleam build # Compile
 > pinned upstream commit. Re-vendoring from upstream will reintroduce both
 > bugs unless the patch is carried over.
 
+The application starts a background step-execution daemon by default on a
+separate connection to the configured database. Set `CRYSTALLINE_DAEMON=0` to
+disable it while keeping the HTTP server available.
+
 Environment:
 
 | Variable | Default | Purpose |
@@ -219,6 +223,7 @@ Environment:
 | `CRYSTALLINE_DB_URL` | — | Remote `libsql://`/`https://` URL (takes precedence) |
 | `CRYSTALLINE_AUTH_TOKEN` | — | Token for the remote URL (required when `CRYSTALLINE_DB_URL` is set) |
 | `CRYSTALLINE_API_TOKEN` | — | Optional bearer token for `/api/v1/*`; unset or empty disables auth. Send `Authorization: Bearer <token>`. `/health` remains public. |
+| `CRYSTALLINE_DAEMON` | enabled | Background step executor; set to `0` to disable |
 | `CRYSTALLINE_SECRET_KEY_BASE` | dev-only value | Wisp cookie/signing secret |
 
 ## Related
