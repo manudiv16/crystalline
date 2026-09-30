@@ -9,9 +9,21 @@
 ///     PATCH  /api/v1/flow-templates/:id        update
 ///     DELETE /api/v1/flow-templates/:id        delete
 ///
+///   Transition sub-resource (issue #18):
+///     GET    /api/v1/flow-templates/:id/transitions                 list (200)
+///     POST   /api/v1/flow-templates/:id/transitions                 add (201; 409 duplicate id; 400 invalid DAG)
+///     DELETE /api/v1/flow-templates/:id/transitions/:transition_id  remove (200; 404 unknown; 400 breaks DAG)
+///
 ///   Instances:
 ///     POST   /api/v1/tasks/:task_id/flow       instantiate (201, status pending)
 ///     GET    /api/v1/tasks/:task_id/flow       instance + execution state
+///     DELETE /api/v1/tasks/:task_id/flow       unassign (200; 404 no instance; 409 active execution)
+///
+/// Unassign is allowed only for terminal executions (completed, rejected,
+/// failed, cancelled); pending, running and awaiting_input are refused. The
+/// validator has no reachability check, so transition edits may disconnect
+/// `initial_node_id` — a deliberate choice: disconnected nodes are a legal
+/// authoring state and running instances execute from their own snapshot.
 ///
 ///   Execution control:
 ///     POST   /api/v1/flows/:instance_id/advance   next engine step (Action)
@@ -33,6 +45,7 @@ import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some, unwrap}
 import gleam/result
+import gleam/string
 import sacrum_gleam/db/connection.{type DbConnection, type DbError}
 import sacrum_gleam/db/executions
 import sacrum_gleam/db/flows
@@ -43,7 +56,8 @@ import sacrum_gleam/domain/execution.{
   execution_status_to_string, new_execution_state,
 }
 import sacrum_gleam/domain/flow.{
-  type FlowInstance, type FlowTemplate, FlowInstance, FlowTemplate,
+  type FlowInstance, type FlowTemplate, type Transition, FlowInstance,
+  FlowTemplate,
 }
 import sacrum_gleam/flow/executor.{
   type Action, AwaitInput, ExecutionError, FlowComplete, FlowReject, RunParallel,
@@ -98,6 +112,9 @@ pub fn flow_routes(conn: DbConnection) -> List(Route) {
     Route(Get, "/api/v1/tasks/:task_id/flow", fn(req, params) {
       get_task_flow(req, params, conn)
     }),
+    Route(Delete, "/api/v1/tasks/:task_id/flow", fn(req, params) {
+      unassign_task_flow(req, params, conn)
+    }),
     // Execution control
     Route(Post, "/api/v1/flows/:instance_id/advance", fn(req, params) {
       advance(req, params, conn)
@@ -114,6 +131,18 @@ pub fn flow_routes(conn: DbConnection) -> List(Route) {
     Route(Post, "/api/v1/flows/:instance_id/cancel", fn(req, params) {
       cancel(req, params, conn)
     }),
+    // ─── Issue #18: transition sub-resource ──────────────────────────────
+    Route(Get, "/api/v1/flow-templates/:id/transitions", fn(req, params) {
+      list_transitions(req, params, conn)
+    }),
+    Route(Post, "/api/v1/flow-templates/:id/transitions", fn(req, params) {
+      add_transition(req, params, conn)
+    }),
+    Route(
+      Delete,
+      "/api/v1/flow-templates/:id/transitions/:transition_id",
+      fn(req, params) { remove_transition(req, params, conn) },
+    ),
   ]
 }
 
@@ -190,7 +219,9 @@ fn delete_template(
     Error(Nil) -> helpers.error_response(400, "Missing template ID")
     Ok(id) ->
       case delete_template_service(conn, id) {
-        Error(message) -> helpers.error_response(409, message)
+        Error(NotFound(message)) -> helpers.error_response(404, message)
+        Error(Conflict(message)) -> helpers.error_response(409, message)
+        Error(error) -> execution_error_response(error)
         Ok(_) ->
           helpers.json_response(
             json.to_string(json.object([#("message", json.string("Deleted"))])),
@@ -260,6 +291,31 @@ fn get_task_flow(
             Ok([]) ->
               helpers.error_response(404, "No execution state for this task")
           }
+      }
+  }
+}
+
+// ─── Issue #18: unassign handler ──────────────────────────────────────────
+
+/// DELETE /api/v1/tasks/:task_id/flow — detach and delete a finished flow
+/// instance so the task can be bound to a fresh flow.
+fn unassign_task_flow(
+  _req: Request,
+  params: Dict(String, String),
+  conn: DbConnection,
+) -> Response {
+  case dict.get(params, "task_id") {
+    Error(Nil) -> helpers.error_response(400, "Missing task ID")
+    Ok(task_id) ->
+      case unassign_service(conn, task_id) {
+        Error(error) -> execution_error_response(error)
+        Ok(_) ->
+          helpers.json_response(
+            json.to_string(
+              json.object([#("message", json.string("Flow unassigned"))]),
+            ),
+            200,
+          )
       }
   }
 }
@@ -370,6 +426,68 @@ fn cancel(
   }
 }
 
+// ─── Issue #18: transition sub-resource handlers ─────────────────────────
+
+fn list_transitions(
+  _req: Request,
+  params: Dict(String, String),
+  conn: DbConnection,
+) -> Response {
+  case dict.get(params, "id") {
+    Error(Nil) -> helpers.error_response(400, "Missing template ID")
+    Ok(id) ->
+      case list_transitions_service(conn, id) {
+        Error(error) -> execution_error_response(error)
+        Ok(transitions) ->
+          helpers.json_response(
+            json.to_string(json.array(transitions, codec.transition_to_json)),
+            200,
+          )
+      }
+  }
+}
+
+fn add_transition(
+  req: Request,
+  params: Dict(String, String),
+  conn: DbConnection,
+) -> Response {
+  use body <- wisp.require_json(req)
+
+  case dict.get(params, "id") {
+    Error(Nil) -> helpers.error_response(400, "Missing template ID")
+    Ok(id) ->
+      case add_transition_service(conn, id, body) {
+        Error(error) -> execution_error_response(error)
+        Ok(transition) ->
+          helpers.json_response(
+            json.to_string(codec.transition_to_json(transition)),
+            201,
+          )
+      }
+  }
+}
+
+fn remove_transition(
+  _req: Request,
+  params: Dict(String, String),
+  conn: DbConnection,
+) -> Response {
+  case dict.get(params, "id"), dict.get(params, "transition_id") {
+    Error(Nil), _ -> helpers.error_response(400, "Missing template ID")
+    _, Error(Nil) -> helpers.error_response(400, "Missing transition ID")
+    Ok(id), Ok(transition_id) ->
+      case remove_transition_service(conn, id, transition_id) {
+        Error(error) -> execution_error_response(error)
+        Ok(_) ->
+          helpers.json_response(
+            json.to_string(json.object([#("message", json.string("Deleted"))])),
+            200,
+          )
+      }
+  }
+}
+
 /// Map an `ExecutionError` to an HTTP error response.
 fn execution_error_response(error: ExecutionError) -> Response {
   case error {
@@ -458,28 +576,172 @@ pub fn update_template_service(
 }
 
 /// Delete a template, rejecting when instances already reference it.
+///
+/// An unknown template id is `NotFound` (404); a template that still has
+/// instances is `Conflict` (409) with the surviving instance count.
 pub fn delete_template_service(
   conn: DbConnection,
   id: String,
-) -> Result(Nil, String) {
-  use _ <- result.try(
-    flows.get_flow_template(conn, id)
-    |> db_to_message
-    |> result.map(fn(_template) { Nil }),
-  )
+) -> Result(Nil, ExecutionError) {
+  use _ <- result.try(case flows.get_flow_template(conn, id) {
+    Ok(_template) -> Ok(Nil)
+    Error(_) -> Error(NotFound("Flow template not found: " <> id))
+  })
   use count <- result.try(
     flows.count_instances_for_template(conn, id)
-    |> db_to_message,
+    |> db_to_message
+    |> result.map_error(Internal),
   )
   case count > 0 {
     True ->
-      Error(
-        "Flow template is in use by " <> int.to_string(count) <> " instance(s)",
-      )
+      Error(Conflict(
+        "Flow template is in use by "
+        <> int.to_string(count)
+        <> " instance(s)",
+      ))
     False ->
       flows.delete_flow_template(conn, id)
       |> db_to_message
+      |> result.map_error(Internal)
   }
+}
+
+// ─── Issue #18: transition and unassign services ─────────────────────────
+
+/// List the transitions stored on a template.
+pub fn list_transitions_service(
+  conn: DbConnection,
+  template_id: String,
+) -> Result(List(Transition), ExecutionError) {
+  case flows.get_flow_template(conn, template_id) {
+    Ok(template) -> Ok(template.transitions)
+    Error(_) -> Error(NotFound("Flow template not found: " <> template_id))
+  }
+}
+
+/// Add one transition to a template.
+///
+/// Transition edits re-run the template validator against the full candidate
+/// graph before anything is persisted. The validator intentionally has no
+/// reachability check: adding or removing the last transition out of
+/// `initial_node_id` is allowed, because disconnected nodes are a legal
+/// authoring state and running instances always use their own snapshot.
+pub fn add_transition_service(
+  conn: DbConnection,
+  template_id: String,
+  body: decode.Dynamic,
+) -> Result(Transition, ExecutionError) {
+  use template <- result.try(case flows.get_flow_template(conn, template_id) {
+    Ok(template) -> Ok(template)
+    Error(_) -> Error(NotFound("Flow template not found: " <> template_id))
+  })
+  use transition <- result.try(
+    decode.run(body, codec.transition_decoder())
+    |> result.map_error(fn(_errors) {
+      BadRequest("Invalid transition body")
+    }),
+  )
+
+  use _ <- result.try(case
+    list.any(template.transitions, fn(stored) { stored.id == transition.id })
+  {
+    True -> Error(Conflict("Transition already exists: " <> transition.id))
+    False -> Ok(Nil)
+  })
+
+  let updated =
+    FlowTemplate(
+      ..template,
+      transitions: list.append(template.transitions, [transition]),
+    )
+  use _ <- result.try(
+    validate_template(updated)
+    |> result.map_error(BadRequest),
+  )
+  use persisted <- result.try(
+    flows.update_flow_template(conn, template_id, updated, milliseconds_now())
+    |> db_to_message
+    |> result.map_error(Internal),
+  )
+
+  case
+    list.find(persisted.transitions, fn(stored) { stored.id == transition.id })
+  {
+    Ok(stored) -> Ok(stored)
+    Error(Nil) -> Error(Internal("Persisted transition not found"))
+  }
+}
+
+/// Remove one transition from a template and re-validate the remaining graph.
+pub fn remove_transition_service(
+  conn: DbConnection,
+  template_id: String,
+  transition_id: String,
+) -> Result(Nil, ExecutionError) {
+  use template <- result.try(case flows.get_flow_template(conn, template_id) {
+    Ok(template) -> Ok(template)
+    Error(_) -> Error(NotFound("Flow template not found: " <> template_id))
+  })
+  use _ <- result.try(case
+    list.any(template.transitions, fn(stored) { stored.id == transition_id })
+  {
+    False -> Error(NotFound("Transition not found: " <> transition_id))
+    True -> Ok(Nil)
+  })
+
+  let updated =
+    FlowTemplate(
+      ..template,
+      transitions: list.filter(template.transitions, fn(stored) {
+        stored.id != transition_id
+      }),
+    )
+  use _ <- result.try(
+    validate_template(updated)
+    |> result.map_error(BadRequest),
+  )
+  flows.update_flow_template(conn, template_id, updated, milliseconds_now())
+  |> db_to_message
+  |> result.map_error(Internal)
+  |> result.map(fn(_template) { Nil })
+}
+
+/// Unbind a task from its flow instance and delete that instance.
+///
+/// Unassign is allowed only for terminal executions (`completed`, `rejected`,
+/// `failed`, `cancelled`); `pending`, `running` and `awaiting_input` are
+/// refused with 409 because an active execution is not safe to remove.
+/// `pending` is refused too: the task is bound and work has not finished,
+/// even though the first advance has not happened yet.
+pub fn unassign_service(
+  conn: DbConnection,
+  task_id: String,
+) -> Result(Nil, ExecutionError) {
+  use instance <- result.try(case flows.get_instance_by_task(conn, task_id) {
+    Ok(instance) -> Ok(instance)
+    Error(_) -> Error(NotFound("No flow instance for this task"))
+  })
+  use state <- result.try(load_execution(conn, instance.id))
+
+  case state.status {
+    Completed | Rejected | Failed | Cancelled -> Ok(Nil)
+    Pending | Running | AwaitingInput ->
+      Error(Conflict(
+        "Cannot unassign flow: execution is "
+        <> execution_status_to_string(state.status),
+      ))
+  }
+  |> result.try(fn(_) {
+    let now = milliseconds_now()
+    use _ <- result.try(
+      tasks.clear_flow_binding(conn, task_id, now)
+      |> db_to_message
+      |> result.map_error(Internal),
+    )
+    flows.delete_flow_instance(conn, instance.id)
+    |> db_to_message
+    |> result.map_error(Internal)
+  })
 }
 
 // ─── Instance services ────────────────────────────────────────────────────
@@ -819,7 +1081,9 @@ fn transition_guard(
   }
 }
 
-/// Validate a template structure. Returns a human-readable message on error.
+/// Validate a template structure. Returns a human-readable message on error;
+/// it names the first `ValidationError` so API callers see the actual cause
+/// and not just a count.
 fn validate_template(template: FlowTemplate) -> Result(Nil, String) {
   case validator.validate(template) {
     Ok(Nil) -> Ok(Nil)
@@ -827,8 +1091,35 @@ fn validate_template(template: FlowTemplate) -> Result(Nil, String) {
       Error(
         "Invalid flow template ("
         <> int.to_string(list.length(errors))
-        <> " validation error(s))",
+        <> " validation error(s), first: "
+        <> first_validation_error(errors)
+        <> ")",
       )
+  }
+}
+
+fn first_validation_error(errors: List(validator.ValidationError)) -> String {
+  case errors {
+    [first, ..] -> validation_error_name(first)
+    [] -> "unknown validation error"
+  }
+}
+
+fn validation_error_name(error: validator.ValidationError) -> String {
+  case error {
+    validator.DuplicateNodeId(id) -> "duplicate node id: " <> id
+    validator.MissingInitialNode(id) -> "missing initial node: " <> id
+    validator.MissingChildRef(node_id, child_id) ->
+      "missing child ref: " <> node_id <> " -> " <> child_id
+    validator.MissingTransitionRef(transition_id, node_id) ->
+      "transition " <> transition_id <> " references unknown node: " <> node_id
+    validator.CycleDetected(path) ->
+      "cycle detected: " <> string.join(path, " -> ")
+    validator.MissingBranchTarget(rule) ->
+      "branch rule targets unknown node: " <> rule.target_id
+    validator.StepMissingPrompt(node_id) -> "step missing prompt: " <> node_id
+    validator.CompositeNodeHasNoChildren(node_id) ->
+      "composite node has no children: " <> node_id
   }
 }
 

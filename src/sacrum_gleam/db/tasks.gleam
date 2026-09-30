@@ -259,6 +259,20 @@ pub fn update_task(
   get_task(conn, id)
 }
 
+/// Clear every task field bound to a flow instance.
+pub fn clear_flow_binding(
+  conn: DbConnection,
+  id: String,
+  now: Int,
+) -> Result(Nil, DbError) {
+  connection.execute(
+    conn,
+    "UPDATE tasks SET flow_template_id = NULL, flow_instance_id = NULL, "
+      <> "current_node_id = NULL, updated_at = ? WHERE id = ?",
+    [IntVal(now), TextVal(id)],
+  )
+}
+
 /// Archive a task. When `cascade` is true, every descendant (all levels) is
 /// archived too. Returns the number of tasks archived.
 pub fn delete_task(
