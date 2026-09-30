@@ -67,3 +67,20 @@ pub fn section_type_from_string(s: String) -> Result(SectionType, String) {
     _ -> Error("Unknown section type: " <> s)
   }
 }
+
+pub fn checklist_state_to_string(state: ChecklistState) -> String {
+  case state {
+    Done -> "done"
+    Undone -> "undone"
+  }
+}
+
+pub fn checklist_state_from_string(
+  s: String,
+) -> Result(ChecklistState, String) {
+  case s {
+    "done" -> Ok(Done)
+    "undone" -> Ok(Undone)
+    _ -> Error("Unknown checklist state: " <> s)
+  }
+}

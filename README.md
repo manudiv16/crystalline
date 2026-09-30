@@ -125,10 +125,31 @@ let flow = crystalline.build_linear_flow(
 )
 ```
 
+## Sections API
+
+Sections belong to a task and are available through these endpoints:
+
+- `GET /api/v1/tasks/:task_id/sections` lists by `order`, then creation time; an
+  existing task with no sections returns `[]`.
+- `POST /api/v1/tasks/:task_id/sections` creates a section. `section_type` and
+  `content` are required; `code_ref` and `checklist_state` are optional. An
+  omitted `order` appends after the task's current maximum.
+- `GET /api/v1/sections/:id`, `PATCH /api/v1/sections/:id`, and
+  `DELETE /api/v1/sections/:id` fetch, partially update, and remove a section.
+  PATCH accepts `content`, `section_type`, `order`, `checklist_state`, and
+  individual `code_ref` fields; `code_ref: null` clears the reference and
+  `checklist_state: null` clears the state.
+
+`section_type` is one of `goal`, `context`, `current_behavior`,
+`desired_behavior`, `checklist_item`, `testing_criterion`, `constraint`,
+`anti_pattern`, or `failure_test`. A code reference contains `path`,
+`line_start`, `line_end`, `name`, and `description`; optional values are null
+when unset. Checklist state is `done`, `undone`, or null.
+
 ## Status
 
-Scaffolded: domain model, flow engine and database layer are written. The build is being
-stabilized and the HTTP surface is not implemented yet.
+Implemented: the domain model, flow engine, database layer, and task, flow,
+execution, and sections HTTP APIs.
 
 Work is tracked as dependency-linked issues so it can be parallelized:
 
