@@ -14,7 +14,9 @@ import sacrum_gleam/domain/flow.{
 /// 3. All child_ids reference existing nodes
 /// 4. All transition from_id/to_id reference existing nodes
 /// 5. No transition is a self-transition (from_id == to_id)
-/// 6. No cycles in the graph (unless through a Loop node)
+/// 6. No cycles that only step/composite nodes take part in — a cycle is legal
+///    only while it crosses a Loop or Branch node, which can break out of it
+///    (see `cycle_can_terminate`)
 /// 7. Branch rules reference valid target nodes
 /// 8. Loop config child_ids reference existing nodes
 /// 9. Step nodes have a prompt
@@ -188,7 +190,8 @@ fn find_illegal_cycles(
   // Build adjacency from transitions + implicit composite edges
   let adj = build_adjacency(template)
 
-  // DFS cycle detection, skipping edges from Loop nodes
+  // DFS cycle detection; a cycle is legal only if a Loop or Branch node on it
+  // can break out of the repetition.
   let all_ids = template.nodes |> dict.keys
   case detect_cycle_dfs(all_ids, adj, template.nodes) {
     [] -> Ok(Nil)
@@ -249,28 +252,58 @@ fn dfs_visit(
 ) -> Result(ValidationError, Nil) {
   case dict.get(nodes, node_id) {
     Error(Nil) -> Error(Nil)
-    Ok(node) -> {
+    Ok(_) -> {
       // Do not revisit a node already explored by this DFS run.
       case dict.has_key(visited, node_id) {
         True -> Error(Nil)
         False -> {
-          // Loop nodes are allowed to cycle back
-          let is_loop = node.node_type == flow.Loop
           let new_path = [node_id, ..path]
           let new_visited = dict.insert(visited, node_id, True)
 
           let neighbors = dict.get(adj, node_id) |> result.unwrap([])
           neighbors
           |> list.find_map(fn(nid) {
-            case list.contains(path, nid), is_loop {
-              True, False -> Ok(CycleDetected(list.reverse([nid, ..new_path])))
-              True, True -> Error(Nil)
-              // Loop nodes can cycle
-              False, _ -> dfs_visit(nid, adj, nodes, new_path, new_visited)
+            case list.contains(path, nid) {
+              False -> dfs_visit(nid, adj, nodes, new_path, new_visited)
+              True -> {
+                let cycle = list.reverse([nid, ..new_path])
+                case cycle_can_terminate(cycle, nodes) {
+                  // The repetition has an exit on the cycle itself.
+                  True -> Error(Nil)
+                  False -> Ok(CycleDetected(cycle))
+                }
+              }
             }
           })
         }
       }
     }
   }
+}
+
+/// Whether a repetition around `cycle` can ever be left again.
+///
+/// Only two node types can break a repetition once it starts:
+///
+/// - `Branch` re-evaluates its `branch_rules` against the variable store on
+///   every visit, so a later pass can route out of the cycle. The shipped
+///   `review_gate` template is exactly this: `gate_branch` → `fix` →
+///   `re_review` → `gate_branch`, exiting to `done` once the reviewer
+///   approves.
+/// - `Loop` bounds its own repetition with `loop_config.max_iterations` and
+///   `exit_condition` before dispatching a child.
+///
+/// A cycle made of only step/composite nodes has no such exit: `find_next_node`
+/// follows the same matching transition on every pass, so the execution would
+/// spin forever. `is_loop` used to be checked on the node that owns the back
+/// edge, which both allowed cycles whose cycle crossed a Loop node and rejected
+/// the shipped Branch-mediated ones; membership is what the rule actually means.
+fn cycle_can_terminate(cycle: List(String), nodes: Dict(String, Node)) -> Bool {
+  cycle
+  |> list.any(fn(id) {
+    case dict.get(nodes, id) {
+      Ok(node) -> list.contains([flow.Branch, flow.Loop], node.node_type)
+      Error(Nil) -> False
+    }
+  })
 }

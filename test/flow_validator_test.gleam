@@ -10,6 +10,12 @@
 /// counter (`src/sacrum_gleam/flow/executor.gleam`, `execute_loop`), and never
 /// follows a self-edge. `find_next_node` follows the matching transition back
 /// to the same node, so a self-transition can only re-dispatch it forever.
+///
+/// Cycles are legal while they cross a Loop (bounded by `loop_config`) or a
+/// Branch (re-routes on every pass): the shipped `review_gate` template loops
+/// `gate_branch → fix → re_review → gate_branch` and exits to `done` on
+/// approval. Cycles built only from step/composite nodes have no exit and stay
+/// rejected.
 import gleam/dict
 import gleam/list
 import gleam/option.{None, Some}
@@ -70,6 +76,27 @@ fn loop_with_child(id: String, body_id: String) -> #(String, Node) {
 
 fn transition(id: String, from: String, to: String) -> Transition {
   Transition(id: id, from_id: from, to_id: to, condition: None, label: None)
+}
+
+/// A Branch router: the engine re-evaluates `branch_rules` on every visit.
+fn branch(id: String, rules: List(#(String, String))) -> #(String, Node) {
+  #(
+    id,
+    Node(
+      id: id,
+      name: id,
+      node_type: flow.Branch,
+      goal: "route on the current variables",
+      prompt: None,
+      child_ids: [],
+      branch_rules: list.map(rules, fn(pair) {
+        flow.BranchRule(condition: pair.0, target_id: pair.1)
+      }),
+      loop_config: None,
+      agent_config: None,
+      output_schema: None,
+    ),
+  )
 }
 
 fn template(
@@ -141,6 +168,45 @@ pub fn two_node_cycle_is_rejected_test() {
   // self-transition verdict leaks in.
   assert list.length(found) >= 1
   assert list.all(found, is_cycle)
+}
+
+/// A three-node cycle of step nodes still has no way out: `find_next_node`
+/// follows the same transition on every pass.
+pub fn step_only_three_node_cycle_is_rejected_test() {
+  let graph =
+    template("step_a", [step("step_a"), step("step_b"), step("step_c")], [
+      transition("t1", "step_a", "step_b"),
+      transition("t2", "step_b", "step_c"),
+      transition("t3", "step_c", "step_a"),
+    ])
+
+  let found = errors(graph)
+  assert list.length(found) >= 1
+  assert list.all(found, is_cycle)
+}
+
+/// The shipped `review_gate` shape: `gate → fix → re_review → gate` with a
+/// Branch router at the top. The Branch re-evaluates its rules every pass, so
+/// the cycle can exit (to `done` once the reviewer approves) — it is legal.
+pub fn branch_mediated_cycle_is_accepted_test() {
+  let graph =
+    template(
+      "gate",
+      [
+        branch("gate", [#("approved", "done"), #("changes", "fix")]),
+        step("fix"),
+        step("re_review"),
+        step("done"),
+      ],
+      [
+        transition("t1", "gate", "fix"),
+        transition("t2", "gate", "done"),
+        transition("t3", "fix", "re_review"),
+        transition("t4", "re_review", "gate"),
+      ],
+    )
+
+  assert validator.validate(graph) == Ok(Nil)
 }
 
 // ─── Valid graphs ─────────────────────────────────────────────────────────

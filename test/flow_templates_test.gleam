@@ -17,7 +17,9 @@ import gleeunit/should
 import sacrum_gleam/db/connection
 import sacrum_gleam/db/migrations
 import sacrum_gleam/domain/flow.{type FlowTemplate, HumanInput}
+import sacrum_gleam/flow/engine as flow_engine
 import sacrum_gleam/flow/templates
+import sacrum_gleam/flow/validator
 import sacrum_gleam/http/router
 import sacrum_gleam/http/routes/flow_templates
 import wisp/simulate
@@ -32,6 +34,31 @@ pub fn each_template_passes_seed_validation_test() {
   templates.all_template_specs()
   |> list.each(fn(spec) {
     let assert Ok(Nil) = templates.validate_for_seed(spec.build())
+  })
+}
+
+/// Every shipped template must also satisfy the authoring validator. The
+/// `review_gate` / `implement_review` shapes loop through the `gate_branch`
+/// Branch node, and `flow_engine.register_template` (used when the daemon
+/// restores persisted templates) runs this same validator — a shipped
+/// template the validator rejects cannot be recreated through
+/// `POST /api/v1/flow-templates` and silently fails to restore at runtime.
+pub fn each_template_passes_flow_validation_test() {
+  templates.all_template_specs()
+  |> list.each(fn(spec) {
+    let assert Ok(Nil) = validator.validate(spec.build())
+  })
+}
+
+/// The daemon restore path: every shipped template must land in the engine
+/// registry (`seed_to_engine` skips the ones `register_template` refuses).
+pub fn seed_to_engine_registers_every_shipped_template_test() {
+  let #(engine, count) = templates.seed_to_engine(flow_engine.new_engine())
+  assert count == 6
+
+  templates.all_template_specs()
+  |> list.each(fn(spec) {
+    let assert Ok(_) = flow_engine.get_template(engine, spec.slug)
   })
 }
 
