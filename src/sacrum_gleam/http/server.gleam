@@ -10,10 +10,12 @@
 import envoy
 import gleam/int
 import gleam/list
+import gleam/option.{None, Some}
 import mist
 import sacrum_gleam/config
 import sacrum_gleam/db/connection
 import sacrum_gleam/db/migrations
+import sacrum_gleam/http/auth_gate
 import sacrum_gleam/http/router
 import sacrum_gleam/http/routes/executions
 import sacrum_gleam/http/routes/flow_templates
@@ -27,7 +29,14 @@ import wisp/wisp_mist
 /// `crystalline.main`), otherwise the server supervision tree is torn down.
 pub fn start(port: Int) -> Nil {
   let #(conn, db_mode) = connect_database()
-  let routes = all_routes(conn, db_mode)
+  // Resolve once at startup; an empty or unset token leaves the API unchanged.
+  let api_token = case envoy.get("CRYSTALLINE_API_TOKEN") {
+    Ok(token) if token != "" -> Some(token)
+    _ -> None
+  }
+  let routes =
+    all_routes(conn, db_mode)
+    |> auth_gate.protect_routes(api_token)
 
   let handler = fn(request: wisp.Request) -> wisp.Response {
     router.match_route(routes, request)
