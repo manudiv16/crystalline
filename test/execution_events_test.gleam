@@ -29,7 +29,7 @@ import sacrum_gleam/domain/execution.{
   StepExecution, StepInProgress,
 }
 import sacrum_gleam/domain/flow.{type FlowInstance, FlowInstance, FlowTemplate}
-import sacrum_gleam/domain/task.{Medium, Task, Ticket, Todo}
+import sacrum_gleam/domain/task.{Medium, Task, Ticket, new_task}
 import sacrum_gleam/http/server
 import sacrum_gleam/runtime/events
 
@@ -48,20 +48,9 @@ fn new_conn() -> DbConnection {
 fn insert_task(conn: DbConnection, id: String, now: Int) -> Nil {
   let task =
     Task(
+      ..new_task("Task " <> id, Ticket, Medium),
       id: id,
       short_id: "short-" <> id,
-      title: "Task " <> id,
-      description: "",
-      level: Ticket,
-      priority: Medium,
-      status: Todo,
-      tags: [],
-      parent_id: None,
-      flow_template_id: None,
-      flow_instance_id: None,
-      current_node_id: None,
-      worktree: None,
-      archived: False,
       created_at: now,
       updated_at: now,
     )

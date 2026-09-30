@@ -150,6 +150,35 @@ background daemon all feed the same stream.
   stream, and heartbeats every 15s keep idle connections alive and detect a
   client that went away.
 
+## Conversational human input
+
+A flow that parks on a `HumanInput` node (`awaiting_input`) can be driven turn
+by turn instead of by one-shot text:
+
+- `POST /api/v1/flows/:instance_id/reply` with `{"message": "<human text>"}`
+  records the turn, feeds it through the same path as
+  `POST /api/v1/flows/:instance_id/input` and answers the usual
+  `{"execution", "action"}` envelope. No `advance` call is needed: the reply
+  itself walks the flow to its next actionable node. Another gate comes back as
+  `action.type = "await_input"` with the execution persisted as
+  `awaiting_input`; an agent step comes back as `"run_step"` (`running`), and a
+  reply on the last gate returns `"flow_complete"` (`completed`).
+- Unknown instance → 404, an execution that is not `awaiting_input` (pending,
+  running or terminal) → 409 naming its status, a missing or blank `message` →
+  400. A refused reply writes nothing.
+- `GET /api/v1/flows/:instance_id/conversation` returns the instance's human
+  turns in order: one `prompt` entry (the gate's prompt) then one `human_input`
+  entry (the reply) per turn, each with `step_execution_id`, `node_id`,
+  `payload`, `sequence` and `created_at`.
+
+Turns are ordinary session logs on the gate's step execution — event types
+`prompt` and `human_input`, sequences `n`/`n + 1` — so `GET /api/v1/executions/
+:step_execution_id/logs` pages them per turn, and `POST /input`/`POST /reject`
+are unchanged. Because the appends go through `db/session_logs.append_log`, a
+reply also appears on the SSE stream as a `session_log` event keyed by the gate
+step execution id (use the `step_execution_id` from the transcript to subscribe
+or resume).
+
 ## Task hierarchy and flow cancellation
 
 `GET /api/v1/tasks/:id/path` returns a `path` array ordered from the root task
