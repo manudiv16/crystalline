@@ -25,6 +25,23 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `implement_review` / `design_implement` to completion through that table, so
   the omission fails the suite.
 
+## Flow graph rules
+
+- `flow/validator.validate` rejects a transition whose `from_id == to_id` for
+  every node type, `Loop` and `Branch` included: the engine never follows a
+  self-edge (loops iterate `loop_config.child_ids` + their iteration counter,
+  branches dispatch their `branch_rules`), so one can only make
+  `find_next_node` re-dispatch the same node forever. Do not re-add a `Loop`/
+  `Branch` exception without changing `flow/executor.gleam` first.
+- A cycle is legal only while it crosses a `Branch` (rules are re-evaluated on
+  every pass — the shipped `review_gate` loops `gate_branch → fix → re_review →
+  gate_branch` and exits to `done`) or a `Loop` (bounded by `loop_config`).
+  Cycles made only of step/composite nodes stay rejected.
+- Every shipped template must pass `validator.validate`: the daemon restores
+  persisted templates through `flow_engine.register_template`, which runs that
+  validator and silently skips what it rejects. Guarded by
+  `test/flow_templates_test.gleam` (spec-by-spec, plus `seed_to_engine`).
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.

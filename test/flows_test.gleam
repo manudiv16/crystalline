@@ -95,6 +95,10 @@ fn action_type() -> decode.Decoder(String) {
   field_decoder("action", string_field("type"))
 }
 
+fn action_node_id() -> decode.Decoder(String) {
+  field_decoder("action", field_decoder("node", string_field("id")))
+}
+
 fn execution_status() -> decode.Decoder(String) {
   field_decoder("execution", string_field("status"))
 }
@@ -146,6 +150,91 @@ fn transition(id: String, from: String, to: String) -> json.Json {
     #("to_id", json.string(to)),
     #("condition", json.null()),
     #("label", json.null()),
+  ])
+}
+
+/// A loop node with one step child, matching the engine's iteration idiom
+/// (`loop_config.child_ids`, not a self-edge).
+fn loop_node(id: String, child_ids: List(String)) -> json.Json {
+  json.object([
+    #("id", json.string(id)),
+    #("name", json.string(id)),
+    #("node_type", json.string("loop")),
+    #("goal", json.string("loop until done")),
+    #("prompt", json.null()),
+    #("child_ids", json.array(child_ids, json.string)),
+    #("branch_rules", json.preprocessed_array([])),
+    #(
+      "loop_config",
+      json.object([
+        #("max_iterations", json.int(3)),
+        #("exit_condition", json.null()),
+        #("child_ids", json.array(child_ids, json.string)),
+      ]),
+    ),
+    #("agent_config", json.null()),
+    #("output_schema", json.null()),
+  ])
+}
+
+/// A Branch node: the engine re-evaluates `branch_rules` on every visit, so a
+/// cycle that crosses it can exit on a later pass.
+fn branch_node(id: String, rules: List(#(String, String))) -> json.Json {
+  json.object([
+    #("id", json.string(id)),
+    #("name", json.string(id)),
+    #("node_type", json.string("branch")),
+    #("goal", json.string("route on the current variables")),
+    #("prompt", json.null()),
+    #("child_ids", json.preprocessed_array([])),
+    #(
+      "branch_rules",
+      json.array(rules, fn(rule) {
+        json.object([
+          #("condition", json.string(rule.0)),
+          #("target_id", json.string(rule.1)),
+        ])
+      }),
+    ),
+    #("loop_config", json.null()),
+    #("agent_config", json.null()),
+    #("output_schema", json.null()),
+  ])
+}
+
+/// The shipped `review_gate` shape: `ask (input) → gate → {done | fix}`,
+/// `fix → re_review → gate`. `gate → fix → re_review → gate` is a cycle that
+/// crosses the Branch, which re-routes once `human_input` changes.
+fn branch_cycle_template(name: String) -> json.Json {
+  json.object([
+    #("name", json.string(name)),
+    #("description", json.string("Branch-mediated cycle")),
+    #("initial_node_id", json.string("ask")),
+    #(
+      "nodes",
+      json.preprocessed_array([
+        human_input_node("ask", "Ask for the review verdict"),
+        branch_node("gate", [
+          #("human_input=approved", "done"),
+          #("human_input=changes", "fix"),
+        ]),
+        step_node("fix", "Address review comments"),
+        human_input_node("re_review", "Re-review after the fixes"),
+        step_node("done", "Mark as approved"),
+      ]),
+    ),
+    #(
+      "transitions",
+      json.preprocessed_array([
+        transition("t1", "ask", "gate"),
+        transition("t2", "gate", "fix"),
+        transition("t3", "gate", "done"),
+        transition("t4", "fix", "re_review"),
+        transition("t5", "re_review", "gate"),
+      ]),
+    ),
+    #("on_done_template_id", json.null()),
+    #("on_reject_template_id", json.null()),
   ])
 }
 
@@ -249,6 +338,20 @@ fn count_rows(
   let assert Ok([[connection.IntVal(count)], ..]) =
     connection.query(conn, sql, params)
   count
+}
+
+/// Count completed `step_executions` rows for one node of a task.
+fn completed_step_rows(
+  conn: connection.DbConnection,
+  task_id: String,
+  node_id: String,
+) -> Int {
+  count_rows(
+    conn,
+    "SELECT COUNT(*) FROM step_executions "
+    <> "WHERE task_id = ? AND node_id = ? AND status = 'completed'",
+    [connection.TextVal(task_id), connection.TextVal(node_id)],
+  )
 }
 
 /// Complete the current step repeatedly until the flow reports
@@ -676,6 +779,179 @@ pub fn invalid_dag_templates_are_rejected_without_persisting_test() {
   assert status(resp) == 400
   assert string.contains(body(resp), "references unknown node: ghost")
   assert count_rows(conn, "SELECT COUNT(*) FROM flow_templates", []) == 0
+}
+
+/// The live validator gap: `step_a → step_b` plus the self-loop `step_b →
+/// step_b` used to be accepted with 201, so an execution would re-dispatch
+/// `step_b` forever. It is now a 400 and nothing is persisted.
+pub fn self_transition_template_is_rejected_without_persisting_test() {
+  let conn = new_conn()
+
+  let self_loop =
+    json.object([
+      #("name", json.string("Self loop")),
+      #("description", json.string("")),
+      #("initial_node_id", json.string("step_a")),
+      #(
+        "nodes",
+        json.preprocessed_array([
+          step_node("step_a", "Do step A"),
+          step_node("step_b", "Do step B"),
+        ]),
+      ),
+      #(
+        "transitions",
+        json.preprocessed_array([
+          transition("t1", "step_a", "step_b"),
+          transition("t2", "step_b", "step_b"),
+        ]),
+      ),
+    ])
+  let resp = post_json(conn, "/api/v1/flow-templates", self_loop)
+  assert status(resp) == 400
+  assert string.contains(body(resp), "self-transition: step_b -> step_b")
+  assert count_rows(conn, "SELECT COUNT(*) FROM flow_templates", []) == 0
+
+  // The same shape on a Loop node is rejected too: loops iterate through
+  // loop_config.child_ids, never through a self-edge.
+  let loop_self_loop =
+    json.object([
+      #("name", json.string("Loop self loop")),
+      #("description", json.string("")),
+      #("initial_node_id", json.string("loop_node")),
+      #(
+        "nodes",
+        json.preprocessed_array([
+          loop_node("loop_node", ["body"]),
+          step_node("body", "Loop body"),
+        ]),
+      ),
+      #(
+        "transitions",
+        json.preprocessed_array([transition("t1", "loop_node", "loop_node")]),
+      ),
+    ])
+  let resp = post_json(conn, "/api/v1/flow-templates", loop_self_loop)
+  assert status(resp) == 400
+  assert string.contains(body(resp), "self-transition: loop_node -> loop_node")
+  assert count_rows(conn, "SELECT COUNT(*) FROM flow_templates", []) == 0
+}
+
+/// A Branch-mediated back-edge (`gate → fix → re_review → gate`) is the loop
+/// idiom the product ships in `review_gate`. It must be accepted at creation
+/// (201) and be genuinely runnable: the Branch re-evaluates its rules on the
+/// second pass and routes out of the cycle.
+pub fn branch_mediated_cycle_is_runnable_test() {
+  let conn = new_conn()
+  let task_id = create_task(conn, "Branch cycle task")
+
+  let resp =
+    post_json(
+      conn,
+      "/api/v1/flow-templates",
+      branch_cycle_template("Branch cycle"),
+    )
+  assert status(resp) == 201
+  let assert Ok(template_id) = json.parse(body(resp), string_field("id"))
+
+  let instance_id = instantiate(conn, task_id, template_id)
+
+  // The flow opens on the human-input node.
+  let resp =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/advance",
+      json.object([]),
+    )
+  assert status(resp) == 200
+  let assert Ok(kind) = json.parse(body(resp), action_type())
+  assert kind == "await_input"
+
+  // "changes" → the gate routes into the cycle body.
+  let resp =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/input",
+      json.object([#("input", json.string("changes"))]),
+    )
+  assert status(resp) == 200
+  let assert Ok(node) = json.parse(body(resp), action_node_id())
+  assert node == "fix"
+
+  // Complete the cycle body → re-review (human input again).
+  let resp =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/complete",
+      json.object([#("output", json.string("comments addressed"))]),
+    )
+  assert status(resp) == 200
+  let assert Ok(kind) = json.parse(body(resp), action_type())
+  assert kind == "await_input"
+  let resp =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/advance",
+      json.object([]),
+    )
+  assert status(resp) == 200
+
+  // Second pass through the same gate: "approved" now exits the cycle.
+  let resp =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/input",
+      json.object([#("input", json.string("approved"))]),
+    )
+  assert status(resp) == 200
+  let assert Ok(node) = json.parse(body(resp), action_node_id())
+  assert node == "done"
+
+  let resp =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/complete",
+      json.object([#("output", json.string("approved"))]),
+    )
+  assert status(resp) == 200
+  let assert Ok(kind) = json.parse(body(resp), action_type())
+  assert kind == "flow_complete"
+
+  // Persisted: the cycle body ran once, the exit node ran, the execution is
+  // terminal — "accepted" means "runnable".
+  assert completed_step_rows(conn, task_id, "fix") == 1
+  assert completed_step_rows(conn, task_id, "done") == 1
+  let resp = get(conn, "/api/v1/tasks/" <> task_id <> "/flow")
+  assert status(resp) == 200
+  let assert Ok(exec_status) = json.parse(body(resp), execution_status())
+  assert exec_status == "completed"
+}
+
+/// The transitions sub-resource re-runs the validator against the full
+/// candidate graph, so a self-loop added after creation is a 400 and the
+/// stored transitions are unchanged.
+pub fn self_transition_added_via_subresource_is_rejected_test() {
+  let conn = new_conn()
+  let template_id = create_template(conn, "Self loop via sub-resource")
+  let transitions_path =
+    "/api/v1/flow-templates/" <> template_id <> "/transitions"
+  let transition_ids = decode.list(string_field("id"))
+
+  let resp =
+    post_json(conn, transitions_path, transition("t2", "step_b", "step_b"))
+  assert status(resp) == 400
+  assert string.contains(body(resp), "self-transition: step_b -> step_b")
+
+  // Re-read the stored row: the rejected transition was not persisted.
+  let assert Ok(ids) =
+    json.parse(body(get(conn, transitions_path)), transition_ids)
+  assert ids == ["t1"]
+  assert count_rows(
+      conn,
+      "SELECT COUNT(*) FROM flow_templates WHERE id = ?",
+      [connection.TextVal(template_id)],
+    )
+    == 1
 }
 
 /// PATCHing a template after instantiation does not rewrite the instance's

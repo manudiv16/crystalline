@@ -1113,6 +1113,8 @@ fn validation_error_name(error: validator.ValidationError) -> String {
       "missing child ref: " <> node_id <> " -> " <> child_id
     validator.MissingTransitionRef(transition_id, node_id) ->
       "transition " <> transition_id <> " references unknown node: " <> node_id
+    validator.SelfTransition(node_id) ->
+      "self-transition: " <> node_id <> " -> " <> node_id
     validator.CycleDetected(path) ->
       "cycle detected: " <> string.join(path, " -> ")
     validator.MissingBranchTarget(rule) ->
