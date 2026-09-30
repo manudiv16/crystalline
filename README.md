@@ -125,6 +125,31 @@ let flow = crystalline.build_linear_flow(
 )
 ```
 
+## Real-time execution updates
+
+`GET /api/v1/executions/:id/events` streams one execution's updates as
+Server-Sent Events: session-log appends and status transitions, published from
+the persistence write points so the HTTP routes, the step runtime and the
+background daemon all feed the same stream.
+
+- `:id` is a step execution id (`step-*`, as in `/api/v1/executions/:id/logs`)
+  or an execution state id (`exec-*`, as returned by `/flows/:id/advance`).
+- Frames carry `event:` (the event kind — `session_log`, `step_status`,
+  `execution_status`), `id:` (the event cursor) and `data:` (a JSON object with
+  `event_sequence`, `type`, `execution_id` and the kind-specific fields). The
+  first frame is always `stream_opened`.
+- Resume with `?after_sequence=N` or the standard `Last-Event-ID` header: the
+  buffered events above `N` are replayed in order before live delivery, each
+  event exactly once. The replay buffer is in memory and bounded; the
+  authoritative history stays `/api/v1/executions/:id/logs`.
+- `EventSource` cannot send request headers, so the stream additionally accepts
+  the API token as `?token=` (stream route only — every other `/api/v1` route
+  still requires `Authorization: Bearer`). Prefer the header where the client
+  can set one, since query strings are logged more readily than headers.
+- Streams are bounded: `?max_ms=` (default 300000, max 3600000) closes the
+  stream, and heartbeats every 15s keep idle connections alive and detect a
+  client that went away.
+
 ## Task hierarchy and flow cancellation
 
 `GET /api/v1/tasks/:id/path` returns a `path` array ordered from the root task
@@ -160,7 +185,7 @@ when unset. Checklist state is `done`, `undone`, or null.
 ## Status
 
 Implemented: the domain model, flow engine, database layer, and task, flow,
-execution, and sections HTTP APIs.
+execution, and sections HTTP APIs, plus the real-time execution event stream.
 
 Work is tracked as dependency-linked issues so it can be parallelized:
 
@@ -222,7 +247,7 @@ Environment:
 | `CRYSTALLINE_DB` | `file:crystalline.db` | Local database URL (`file:` path or `:memory:`) |
 | `CRYSTALLINE_DB_URL` | — | Remote `libsql://`/`https://` URL (takes precedence) |
 | `CRYSTALLINE_AUTH_TOKEN` | — | Token for the remote URL (required when `CRYSTALLINE_DB_URL` is set) |
-| `CRYSTALLINE_API_TOKEN` | — | Optional bearer token for `/api/v1/*`; unset or empty disables auth. Send `Authorization: Bearer <token>`. `/health` remains public. |
+| `CRYSTALLINE_API_TOKEN` | — | Optional bearer token for `/api/v1/*`; unset or empty disables auth. Send `Authorization: Bearer <token>` (the event stream also accepts `?token=` — see above). `/health` remains public. |
 | `CRYSTALLINE_DAEMON` | enabled | Background step executor; set to `0` to disable |
 | `CRYSTALLINE_SECRET_KEY_BASE` | dev-only value | Wisp cookie/signing secret |
 

@@ -25,6 +25,22 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `implement_review` / `design_implement` to completion through that table, so
   the omission fails the suite.
 
+## Real-time execution updates
+
+- The SSE route `GET /api/v1/executions/:id/events` is deliberately **not** in
+  `all_routes`: `wisp_mist` can only pass `Text`/`Bytes`/`File` bodies, so
+  `server.start/1` dispatches that path to a dedicated Mist branch
+  (`src/sacrum_gleam/http/execution_stream.gleam`, using
+  `mist.server_sent_events`). Adding it to `all_routes` cannot work.
+- Events are published from the persistence write points
+  (`db/session_logs.append_log`, `db/executions.update_step_execution`,
+  `update_execution_status`, `save_execution_state`) into the in-BEAM registry in
+  `src/sacrum_gleam/runtime/events.gleam`; new execution writers must publish
+  there to be visible on the stream.
+- The stream route accepts the API token as `?token=` on top of the bearer
+  header, because `EventSource` cannot set headers; every other route stays
+  header-only.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.

@@ -8,14 +8,19 @@
 /// wires task, execution, flow-template and flow execution APIs in addition to
 /// the health endpoint.
 import envoy
+import gleam/http/request as http_request
+import gleam/http/response as http_response
 import gleam/int
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
+import gleam/otp/actor
+import gleam/otp/static_supervisor as supervisor
 import mist
 import sacrum_gleam/config
 import sacrum_gleam/db/connection
 import sacrum_gleam/db/migrations
 import sacrum_gleam/http/auth_gate
+import sacrum_gleam/http/execution_stream
 import sacrum_gleam/http/router
 import sacrum_gleam/http/routes/artifacts
 import sacrum_gleam/http/routes/executions
@@ -23,6 +28,7 @@ import sacrum_gleam/http/routes/flow_templates
 import sacrum_gleam/http/routes/flows
 import sacrum_gleam/http/routes/sections
 import sacrum_gleam/http/routes/tasks
+import sacrum_gleam/runtime/events
 import wisp
 import wisp/wisp_mist
 
@@ -36,21 +42,8 @@ pub fn start(port: Int) -> Nil {
     Ok(token) if token != "" -> Some(token)
     _ -> None
   }
-  let routes =
-    all_routes(conn, db_mode)
-    |> auth_gate.protect_routes(api_token)
 
-  let handler = fn(request: wisp.Request) -> wisp.Response {
-    router.match_route(routes, request)
-  }
-
-  case
-    handler
-    |> wisp_mist.handler(secret_key_base())
-    |> mist.new
-    |> mist.port(port)
-    |> mist.start
-  {
+  case start_with_connection(port, conn, db_mode, api_token) {
     Ok(_) -> Nil
     // Typical causes: the port is already bound or the interface is invalid.
     Error(_) ->
@@ -58,6 +51,51 @@ pub fn start(port: Int) -> Nil {
         "Failed to start the HTTP server on port " <> int.to_string(port)
       }
   }
+}
+
+/// Start the server against an already-connected database.
+///
+/// `start/1` resolves the configuration and calls this; tests use it to run a
+/// real listener on a free port over a temporary database.
+///
+/// Requests are dispatched in two steps: `GET /api/v1/executions/:id/events`
+/// is answered by `execution_stream` (Mist's Server-Sent Events support cannot
+/// produce a Wisp response body, see that module), everything else goes
+/// through the unchanged Wisp handler over `all_routes`.
+pub fn start_with_connection(
+  port: Int,
+  conn: connection.DbConnection,
+  db_mode: String,
+  api_token: Option(String),
+) -> Result(actor.Started(supervisor.Supervisor), actor.StartError) {
+  // The event registry fans out execution updates to stream subscribers; it
+  // must be running before any stream can be opened.
+  events.start()
+
+  let routes =
+    all_routes(conn, db_mode)
+    |> auth_gate.protect_routes(api_token)
+
+  let wisp_handler =
+    wisp_mist.handler(
+      fn(request: wisp.Request) { router.match_route(routes, request) },
+      secret_key_base(),
+    )
+
+  let handler = fn(request: http_request.Request(mist.Connection)) -> http_response.Response(
+    mist.ResponseData,
+  ) {
+    case execution_stream.execution_id_for(request) {
+      Some(execution_id) ->
+        execution_stream.serve(request, execution_id, conn, api_token)
+      None -> wisp_handler(request)
+    }
+  }
+
+  handler
+  |> mist.new
+  |> mist.port(port)
+  |> mist.start
 }
 
 /// Complete production route table, shared by the live server and e2e tests.

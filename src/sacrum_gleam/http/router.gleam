@@ -58,6 +58,19 @@ fn extract_params(
   extract_params_helper(pattern_segments, path_segments, dict.new())
 }
 
+/// Extract the path parameters that `pattern` captures from `path`.
+///
+/// This is the matcher `match_route` uses. It is public so handlers that
+/// cannot go through the `Route`/`Response` table — the Server-Sent Events
+/// branch in `server.start/1` — reuse one route syntax instead of parsing
+/// paths a second way.
+pub fn path_params(
+  pattern: String,
+  path: String,
+) -> Result(Dict(String, String), Nil) {
+  extract_params(pattern, path)
+}
+
 fn extract_params_helper(
   pattern: List(String),
   path: List(String),

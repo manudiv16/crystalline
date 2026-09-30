@@ -4,6 +4,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import sacrum_gleam/db/connection.{type DbConnection, type DbError}
 import sacrum_gleam/domain/session.{type SessionLog, SessionLog}
+import sacrum_gleam/runtime/events
 
 /// Session log persistence for step executions.
 ///
@@ -92,6 +93,9 @@ pub fn append_log(
   case outcome {
     Ok(log) -> {
       use _ <- result.try(connection.execute(conn, "COMMIT", []))
+      // Publish only after the row is committed, so a stream never sees an
+      // append that the database rejected or rolled back.
+      events.publish_session_log(log)
       Ok(log)
     }
     Error(error) -> {
