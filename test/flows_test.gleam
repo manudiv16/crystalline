@@ -12,6 +12,7 @@
 import gleam/dynamic/decode
 import gleam/http
 import gleam/json
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
 import gleeunit
@@ -20,6 +21,8 @@ import sacrum_gleam/db/migrations
 import sacrum_gleam/db/session_logs
 import sacrum_gleam/db/tasks as db_tasks
 import sacrum_gleam/http/router
+import sacrum_gleam/http/routes/flows
+import sacrum_gleam/http/routes/tasks
 import sacrum_gleam/http/server
 import wisp
 import wisp/simulate as sim
@@ -349,7 +352,7 @@ fn completed_step_rows(
   count_rows(
     conn,
     "SELECT COUNT(*) FROM step_executions "
-    <> "WHERE task_id = ? AND node_id = ? AND status = 'completed'",
+      <> "WHERE task_id = ? AND node_id = ? AND status = 'completed'",
     [connection.TextVal(task_id), connection.TextVal(node_id)],
   )
 }
@@ -385,7 +388,8 @@ fn complete_until_flow_complete(
 pub fn create_template_returns_201_test() {
   let conn = new_conn()
 
-  let resp = post_json(conn, "/api/v1/flow-templates", linear_template("Linear"))
+  let resp =
+    post_json(conn, "/api/v1/flow-templates", linear_template("Linear"))
   assert status(resp) == 201
 
   let response_body = body(resp)
@@ -503,7 +507,8 @@ pub fn instantiate_creates_pending_execution_test() {
   // GET /api/v1/tasks/:task_id/flow reflects the same data.
   let flow_resp = get(conn, "/api/v1/tasks/" <> task_id <> "/flow")
   assert status(flow_resp) == 200
-  let assert Ok(fetched_status) = json.parse(body(flow_resp), execution_status())
+  let assert Ok(fetched_status) =
+    json.parse(body(flow_resp), execution_status())
   assert fetched_status == "pending"
 }
 
@@ -550,11 +555,12 @@ pub fn advance_returns_run_step_action_test() {
   let task_id = create_task(conn, "Advancing task")
   let instance_id = instantiate(conn, task_id, template_id)
 
-  let resp = post_json(
-    conn,
-    "/api/v1/flows/" <> instance_id <> "/advance",
-    json.object([]),
-  )
+  let resp =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/advance",
+      json.object([]),
+    )
   assert status(resp) == 200
 
   let response_body = body(resp)
@@ -575,11 +581,12 @@ pub fn complete_drives_flow_to_completion_test() {
   let task_id = create_task(conn, "Completing task")
   let instance_id = instantiate(conn, task_id, template_id)
 
-  let _ = post_json(
-    conn,
-    "/api/v1/flows/" <> instance_id <> "/advance",
-    json.object([]),
-  )
+  let _ =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/advance",
+      json.object([]),
+    )
 
   // Complete step A → next action runs step B.
   let resp =
@@ -611,11 +618,12 @@ pub fn complete_drives_flow_to_completion_test() {
   assert exec_status == "completed"
 
   // A completed flow cannot advance again.
-  let resp = post_json(
-    conn,
-    "/api/v1/flows/" <> instance_id <> "/advance",
-    json.object([]),
-  )
+  let resp =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/advance",
+      json.object([]),
+    )
   assert status(resp) == 409
 }
 
@@ -630,23 +638,26 @@ pub fn input_resumes_awaiting_input_flow_test() {
   let instance_id = instantiate(conn, task_id, template_id)
 
   // Advance past the initial step.
-  let _ = post_json(
-    conn,
-    "/api/v1/flows/" <> instance_id <> "/advance",
-    json.object([]),
-  )
-  let _ = post_json(
-    conn,
-    "/api/v1/flows/" <> instance_id <> "/complete",
-    json.object([#("output", json.string("step A done"))]),
-  )
+  let _ =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/advance",
+      json.object([]),
+    )
+  let _ =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/complete",
+      json.object([#("output", json.string("step A done"))]),
+    )
 
   // The human-input node parks the execution.
-  let resp = post_json(
-    conn,
-    "/api/v1/flows/" <> instance_id <> "/advance",
-    json.object([]),
-  )
+  let resp =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/advance",
+      json.object([]),
+    )
   assert status(resp) == 200
   let response_body = body(resp)
   let assert Ok(kind) = json.parse(response_body, action_type())
@@ -655,11 +666,12 @@ pub fn input_resumes_awaiting_input_flow_test() {
   assert exec_status == "awaiting_input"
 
   // Advancing while awaiting input is rejected.
-  let resp = post_json(
-    conn,
-    "/api/v1/flows/" <> instance_id <> "/advance",
-    json.object([]),
-  )
+  let resp =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/advance",
+      json.object([]),
+    )
   assert status(resp) == 409
 
   // Providing input resumes execution toward the next step.
@@ -683,26 +695,29 @@ pub fn reject_marks_execution_rejected_test() {
   let task_id = create_task(conn, "Rejected task")
   let instance_id = instantiate(conn, task_id, template_id)
 
-  let _ = post_json(
-    conn,
-    "/api/v1/flows/" <> instance_id <> "/advance",
-    json.object([]),
-  )
+  let _ =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/advance",
+      json.object([]),
+    )
 
-  let resp = post_json(
-    conn,
-    "/api/v1/flows/" <> instance_id <> "/reject",
-    json.object([]),
-  )
+  let resp =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/reject",
+      json.object([]),
+    )
   assert status(resp) == 200
   let assert Ok(exec_status) = json.parse(body(resp), execution_status())
   assert exec_status == "rejected"
 
-  let resp = post_json(
-    conn,
-    "/api/v1/flows/" <> instance_id <> "/advance",
-    json.object([]),
-  )
+  let resp =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/advance",
+      json.object([]),
+    )
   assert status(resp) == 409
 }
 
@@ -946,11 +961,9 @@ pub fn self_transition_added_via_subresource_is_rejected_test() {
   let assert Ok(ids) =
     json.parse(body(get(conn, transitions_path)), transition_ids)
   assert ids == ["t1"]
-  assert count_rows(
-      conn,
-      "SELECT COUNT(*) FROM flow_templates WHERE id = ?",
-      [connection.TextVal(template_id)],
-    )
+  assert count_rows(conn, "SELECT COUNT(*) FROM flow_templates WHERE id = ?", [
+      connection.TextVal(template_id),
+    ])
     == 1
 }
 
@@ -1046,7 +1059,8 @@ pub fn transitions_subresource_crud_test() {
   let resp =
     post_json(conn, transitions_path, transition("t1", "step_a", "step_b"))
   assert status(resp) == 409
-  let assert Ok(ids) = json.parse(body(get(conn, transitions_path)), transition_ids)
+  let assert Ok(ids) =
+    json.parse(body(get(conn, transitions_path)), transition_ids)
   assert ids == ["t1"]
 
   // Dangling reference → 400 naming the validator verdict, nothing persisted.
@@ -1054,7 +1068,8 @@ pub fn transitions_subresource_crud_test() {
     post_json(conn, transitions_path, transition("t9", "step_a", "ghost"))
   assert status(resp) == 400
   assert string.contains(body(resp), "references unknown node: ghost")
-  let assert Ok(ids) = json.parse(body(get(conn, transitions_path)), transition_ids)
+  let assert Ok(ids) =
+    json.parse(body(get(conn, transitions_path)), transition_ids)
   assert ids == ["t1"]
 
   // A valid second transition is stored and returned.
@@ -1063,7 +1078,8 @@ pub fn transitions_subresource_crud_test() {
   assert status(resp) == 201
   let assert Ok(stored_id) = json.parse(body(resp), string_field("id"))
   assert stored_id == "t2"
-  let assert Ok(ids) = json.parse(body(get(conn, transitions_path)), transition_ids)
+  let assert Ok(ids) =
+    json.parse(body(get(conn, transitions_path)), transition_ids)
   assert ids == ["t1", "t2"]
 
   // Unknown transition id → 404; known id → 200 and it is gone.
@@ -1071,14 +1087,14 @@ pub fn transitions_subresource_crud_test() {
   assert status(resp) == 404
   let resp = delete(conn, transitions_path <> "/t2")
   assert status(resp) == 200
-  let assert Ok(ids) = json.parse(body(get(conn, transitions_path)), transition_ids)
+  let assert Ok(ids) =
+    json.parse(body(get(conn, transitions_path)), transition_ids)
   assert ids == ["t1"]
 
   // Unknown template id → 404 on all three verbs.
   let missing_path = "/api/v1/flow-templates/tpl-missing/transitions"
   assert status(get(conn, missing_path)) == 404
-  let resp =
-    post_json(conn, missing_path, transition("t1", "step_a", "step_b"))
+  let resp = post_json(conn, missing_path, transition("t1", "step_a", "step_b"))
   assert status(resp) == 404
   assert status(delete(conn, missing_path <> "/t1")) == 404
 }
@@ -1116,8 +1132,7 @@ pub fn remove_transition_revalidates_remaining_graph_test() {
       ],
     )
 
-  let resp =
-    delete(conn, "/api/v1/flow-templates/tpl-legacy/transitions/t2")
+  let resp = delete(conn, "/api/v1/flow-templates/tpl-legacy/transitions/t2")
   assert status(resp) == 200
 
   let resp = get(conn, "/api/v1/flow-templates/tpl-legacy/transitions")
@@ -1229,11 +1244,9 @@ pub fn unassign_completed_flow_cascades_and_rebinds_test() {
   // Attach a session log to the recorded step so the cascade assertions can
   // fail if session_logs ever stop cascading from flow_instances.
   let assert Ok([[connection.TextVal(step_id)], ..]) =
-    connection.query(
-      conn,
-      "SELECT id FROM step_executions WHERE task_id = ?",
-      [connection.TextVal(task_id)],
-    )
+    connection.query(conn, "SELECT id FROM step_executions WHERE task_id = ?", [
+      connection.TextVal(task_id),
+    ])
   let assert Ok(_) =
     session_logs.append_log(conn, step_id, task_id, "text", "{}", 0)
 
@@ -1309,4 +1322,329 @@ pub fn unassign_completed_flow_cascades_and_rebinds_test() {
       json.object([#("template_id", json.string(template_id))]),
     )
   assert status(resp) == 201
+}
+
+fn all_routes(conn: connection.DbConnection) -> List(router.Route) {
+  list.append(tasks.task_routes(conn), flows.flow_routes(conn))
+}
+
+fn execution_started_at() -> decode.Decoder(Option(Int)) {
+  field_decoder(
+    "execution",
+    field_decoder("started_at", decode.optional(decode.int)),
+  )
+}
+
+fn execution_completed_at() -> decode.Decoder(Option(Int)) {
+  field_decoder(
+    "execution",
+    field_decoder("completed_at", decode.optional(decode.int)),
+  )
+}
+
+// `POST /cancel` answers with the bare execution object rather than the
+// `{execution, action}` envelope.
+
+fn body_started_at() -> decode.Decoder(Option(Int)) {
+  field_decoder("started_at", decode.optional(decode.int))
+}
+
+fn body_completed_at() -> decode.Decoder(Option(Int)) {
+  field_decoder("completed_at", decode.optional(decode.int))
+}
+
+fn lifecycle_row(
+  conn: connection.DbConnection,
+  instance_id: String,
+) -> #(String, Option(Int), Option(Int)) {
+  let assert Ok(rows) =
+    connection.query(
+      conn,
+      "SELECT status, started_at, completed_at FROM execution_states "
+        <> "WHERE flow_instance_id = ?",
+      [connection.TextVal(instance_id)],
+    )
+  let assert [[connection.TextVal(row_status), started, completed], ..] = rows
+  #(row_status, int_option_value(started), int_option_value(completed))
+}
+
+fn int_option_value(value: connection.Value) -> Option(Int) {
+  case value {
+    connection.IntVal(v) -> Some(v)
+    _ -> None
+  }
+}
+
+/// Milliseconds since the epoch are far above any placeholder a pure engine
+/// could fabricate (the executor marks state with `0`), so this rejects a row
+/// that stored the sentinel instead of the clock.
+fn assert_real_timestamp(value: Option(Int)) -> Int {
+  let assert Some(stamp) = value
+  assert stamp > 1_000_000_000_000
+  stamp
+}
+
+/// Spin until the wall clock has moved past `instant` (milliseconds since the
+/// epoch), so the next persist is observably later.
+///
+/// A whole drive can otherwise finish inside one millisecond, in which case a
+/// regression that re-stamps `started_at` on every persist would store a value
+/// identical to the original: the equality assertion could not fail. The loop
+/// terminates as soon as the clock ticks (well under a millisecond).
+fn wait_past_clock(instant: Int) -> Nil {
+  case flows.milliseconds_now() > instant {
+    True -> Nil
+    False -> wait_past_clock(instant)
+  }
+}
+
+// ─── Acceptance tests ─────────────────────────────────────────────────────
+
+/// POST /api/v1/flow-templates returns the created template with status 201.
+pub fn advance_persists_started_at_test() {
+  let conn = new_conn()
+  let template_id = create_template(conn, "Lifecycle starter")
+  let task_id = create_task(conn, "Lifecycle start task")
+  let instance_id = instantiate(conn, task_id, template_id)
+
+  // A pending execution carries no lifecycle timestamps.
+  assert lifecycle_row(conn, instance_id) == #("pending", None, None)
+
+  let resp =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/advance",
+      json.object([]),
+    )
+  assert status(resp) == 200
+  let assert Ok(reported_started) =
+    json.parse(body(resp), execution_started_at())
+  let assert Ok(reported_completed) =
+    json.parse(body(resp), execution_completed_at())
+  assert reported_completed == None
+
+  let #(row_status, row_started, row_completed) =
+    lifecycle_row(conn, instance_id)
+  assert row_status == "running"
+  assert row_completed == None
+  let started = assert_real_timestamp(row_started)
+  // The response must not report a timestamp that was never persisted.
+  assert reported_started == Some(started)
+
+  // Reads round-trip the persisted value.
+  let flow_resp = get(conn, "/api/v1/tasks/" <> task_id <> "/flow")
+  assert status(flow_resp) == 200
+  let assert Ok(fetched_started) =
+    json.parse(body(flow_resp), execution_started_at())
+  assert fetched_started == Some(started)
+}
+
+/// Reaching the terminal status stamps `completed_at` and keeps the original
+/// `started_at` across the intermediate persists (a later persist must not
+/// null it out); the final response agrees with the row.
+pub fn completion_persists_completed_at_and_keeps_started_at_test() {
+  let conn = new_conn()
+  let template_id = create_template(conn, "Lifecycle completer")
+  let task_id = create_task(conn, "Lifecycle complete task")
+  let instance_id = instantiate(conn, task_id, template_id)
+
+  let _ =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/advance",
+      json.object([]),
+    )
+  let #(_, after_advance_started, after_advance_completed) =
+    lifecycle_row(conn, instance_id)
+  let started = assert_real_timestamp(after_advance_started)
+  assert after_advance_completed == None
+  // Every later persist must happen at a strictly later clock instant, so a
+  // regression that re-stamps `started_at` cannot hide behind millisecond
+  // granularity.
+  wait_past_clock(started)
+
+  // Complete step A: still running, so `started_at` must survive the persist
+  // and `completed_at` must stay NULL.
+  let _ =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/complete",
+      json.object([#("output", json.string("step A done"))]),
+    )
+  assert lifecycle_row(conn, instance_id) == #("running", Some(started), None)
+  wait_past_clock(started)
+
+  // Complete step B: terminal, so `completed_at` is stamped.
+  let resp =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/complete",
+      json.object([#("output", json.string("step B done"))]),
+    )
+  assert status(resp) == 200
+  let assert Ok(reported_started) =
+    json.parse(body(resp), execution_started_at())
+  let assert Ok(reported_completed) =
+    json.parse(body(resp), execution_completed_at())
+
+  let #(row_status, row_started, row_completed) =
+    lifecycle_row(conn, instance_id)
+  assert row_status == "completed"
+  let completed = assert_real_timestamp(row_completed)
+  // Byte-identical to the value persisted by the first advance.
+  assert row_started == Some(started)
+  assert completed >= started
+  assert reported_started == Some(started)
+  assert reported_completed == Some(completed)
+}
+
+/// Cancelling a running execution stamps `completed_at`, preserves the
+/// original `started_at`, and the response agrees with the row.
+pub fn cancel_persists_completed_at_and_keeps_started_at_test() {
+  let conn = new_conn()
+  let template_id = create_template(conn, "Lifecycle cancellable")
+  let task_id = create_task(conn, "Lifecycle cancel task")
+  let instance_id = instantiate(conn, task_id, template_id)
+
+  let _ =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/advance",
+      json.object([]),
+    )
+  let #(_, after_advance_started, _) = lifecycle_row(conn, instance_id)
+  let started = assert_real_timestamp(after_advance_started)
+  wait_past_clock(started)
+
+  let resp =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/cancel",
+      json.object([]),
+    )
+  assert status(resp) == 200
+  let assert Ok(reported_started) = json.parse(body(resp), body_started_at())
+  let assert Ok(reported_completed) =
+    json.parse(body(resp), body_completed_at())
+
+  let #(row_status, row_started, row_completed) =
+    lifecycle_row(conn, instance_id)
+  assert row_status == "cancelled"
+  assert row_started == Some(started)
+  let completed = assert_real_timestamp(row_completed)
+  assert completed >= started
+  assert reported_started == Some(started)
+  assert reported_completed == Some(completed)
+}
+
+/// The `input` resume path (running → awaiting_input → running → completed)
+/// must also keep the original `started_at` byte-identical, with
+/// `completed_at` stamped only once the flow terminates.
+pub fn input_preserves_started_at_until_completion_test() {
+  let conn = new_conn()
+  let resp =
+    post_json(conn, "/api/v1/flow-templates", gated_template("Gated lifecycle"))
+  let assert 201 = status(resp)
+  let assert Ok(template_id) = json.parse(body(resp), string_field("id"))
+  let task_id = create_task(conn, "Gated lifecycle task")
+  let instance_id = instantiate(conn, task_id, template_id)
+
+  // Advance past the initial step and capture the persisted start instant.
+  let _ =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/advance",
+      json.object([]),
+    )
+  let #(_, after_advance_started, _) = lifecycle_row(conn, instance_id)
+  let started = assert_real_timestamp(after_advance_started)
+  wait_past_clock(started)
+
+  // Completing step A parks the execution on the human-input node.
+  let _ =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/complete",
+      json.object([#("output", json.string("step A done"))]),
+    )
+  assert lifecycle_row(conn, instance_id) == #("running", Some(started), None)
+
+  let _ =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/advance",
+      json.object([]),
+    )
+  assert lifecycle_row(conn, instance_id)
+    == #("awaiting_input", Some(started), None)
+  wait_past_clock(started)
+
+  // Resuming with input keeps the same start instant.
+  let resp =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/input",
+      json.object([#("input", json.string("approved"))]),
+    )
+  assert status(resp) == 200
+  assert lifecycle_row(conn, instance_id) == #("running", Some(started), None)
+  wait_past_clock(started)
+
+  // The terminal transition stamps `completed_at` at or after `started_at`.
+  let resp =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/complete",
+      json.object([#("output", json.string("step B done"))]),
+    )
+  assert status(resp) == 200
+  let assert Ok(reported_started) =
+    json.parse(body(resp), execution_started_at())
+  let assert Ok(reported_completed) =
+    json.parse(body(resp), execution_completed_at())
+
+  let #(row_status, row_started, row_completed) =
+    lifecycle_row(conn, instance_id)
+  assert row_status == "completed"
+  let completed = assert_real_timestamp(row_completed)
+  assert row_started == Some(started)
+  assert completed >= started
+  assert reported_started == Some(started)
+  assert reported_completed == Some(completed)
+}
+
+/// Rejecting an execution stamps `completed_at` and keeps `started_at`.
+pub fn reject_persists_completed_at_test() {
+  let conn = new_conn()
+  let template_id = create_template(conn, "Lifecycle rejectable")
+  let task_id = create_task(conn, "Lifecycle reject task")
+  let instance_id = instantiate(conn, task_id, template_id)
+
+  let _ =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/advance",
+      json.object([]),
+    )
+  let #(_, after_advance_started, _) = lifecycle_row(conn, instance_id)
+  let started = assert_real_timestamp(after_advance_started)
+  wait_past_clock(started)
+
+  let resp =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/reject",
+      json.object([]),
+    )
+  assert status(resp) == 200
+  let assert Ok(reported_completed) =
+    json.parse(body(resp), execution_completed_at())
+
+  let #(row_status, row_started, row_completed) =
+    lifecycle_row(conn, instance_id)
+  assert row_status == "rejected"
+  assert row_started == Some(started)
+  let completed = assert_real_timestamp(row_completed)
+  assert completed >= started
+  assert reported_completed == Some(completed)
 }
