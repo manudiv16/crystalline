@@ -14,8 +14,18 @@ import sacrum_gleam/domain/task.{
 import sacrum_gleam/json/codec
 
 /// Task CRUD operations against libsql.
+///
+/// ### Project scope
+///
+/// Tasks belong to exactly one project (`project_id`). Its stored `short_id`
+/// is the scoped form `<project_id>:<short_id>` (`scoped_short_id`), because
+/// the 0001 schema declares `short_id TEXT NOT NULL UNIQUE` inline and SQLite
+/// cannot drop that constraint in place; the scoped value keeps the constraint
+/// while letting two projects share the same user-visible id. The domain
+/// `Task.short_id` always carries the user-visible part (`display_short_id`).
 pub type TaskFilter {
   TaskFilter(
+    project_id: String,
     level: Option(Level),
     status: Option(TaskStatus),
     parent_id: Option(String),
@@ -51,8 +61,9 @@ pub type TaskPathError {
   TaskPathDatabaseError(DbError)
 }
 
-pub fn default_filter() -> TaskFilter {
+pub fn default_filter(project_id: String) -> TaskFilter {
   TaskFilter(
+    project_id: project_id,
     level: None,
     status: None,
     parent_id: None,
@@ -94,7 +105,29 @@ const task_columns = [
   "archived",
   "created_at",
   "updated_at",
+  "project_id",
 ]
+
+/// Storage form of a task short id: `<project_id>:<short_id>`.
+///
+/// The 0001 schema's inline `short_id UNIQUE` can only be dropped by rebuilding
+/// `tasks`, which this build's foreign-key enforcement turns into a cascading
+/// delete of every child row. Prefixing the owning project keeps the constraint
+/// satisfied while making ids unique per project rather than globally.
+pub fn scoped_short_id(project_id: String, short_id: String) -> String {
+  project_id <> ":" <> short_id
+}
+
+/// User-visible part of a stored short id.
+///
+/// Tolerates unscoped values (rows written before 0003 by raw SQL) by
+/// returning them unchanged.
+pub fn display_short_id(stored: String) -> String {
+  case string.split(stored, ":") {
+    [_, rest, ..tail] -> string.join([rest, ..tail], ":")
+    _ -> stored
+  }
+}
 
 fn columns_sql() -> String {
   string.join(task_columns, ", ")
@@ -118,13 +151,13 @@ pub fn create_task(
     "INSERT INTO tasks "
     <> "(id, short_id, title, description, level, priority, status, tags, "
     <> "parent_id, flow_template_id, flow_instance_id, current_node_id, "
-    <> "worktree, archived, created_at, updated_at) "
-    <> "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    <> "worktree, archived, created_at, updated_at, project_id) "
+    <> "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   }
 
   let params = [
     TextVal(task.id),
-    TextVal(task.short_id),
+    TextVal(scoped_short_id(task.project_id, task.short_id)),
     TextVal(task.title),
     TextVal(task.description),
     TextVal(level_to_string(task.level)),
@@ -139,6 +172,7 @@ pub fn create_task(
     IntVal(bool_to_int(task.archived)),
     IntVal(now),
     IntVal(now),
+    TextVal(task.project_id),
   ]
 
   connection.execute(conn, statement, params)
@@ -210,15 +244,39 @@ pub fn task_exists(conn: DbConnection, id: String) -> Result(Bool, DbError) {
   Ok(count_from_row(row) > 0)
 }
 
-/// Return whether a task with the given short ID already exists.
+/// Return whether a task with the given short ID already exists in a project.
+///
+/// Scoped, not global: two projects may hold the same user-visible short id.
 pub fn short_id_exists(
   conn: DbConnection,
+  project_id: String,
   short_id: String,
 ) -> Result(Bool, DbError) {
   use row <- result.try(
-    connection.query_one(conn, "SELECT COUNT(*) FROM tasks WHERE short_id = ?", [
-      TextVal(short_id),
-    ]),
+    connection.query_one(
+      conn,
+      "SELECT COUNT(*) FROM tasks WHERE project_id = ? AND short_id = ?",
+      [TextVal(project_id), TextVal(scoped_short_id(project_id, short_id))],
+    ),
+  )
+  Ok(count_from_row(row) > 0)
+}
+
+/// Return whether a task with the given ID exists inside a project.
+///
+/// Used by the project-scoped list endpoints, which must not reveal another
+/// project's task through its ID.
+pub fn task_in_project_exists(
+  conn: DbConnection,
+  id: String,
+  project_id: String,
+) -> Result(Bool, DbError) {
+  use row <- result.try(
+    connection.query_one(
+      conn,
+      "SELECT COUNT(*) FROM tasks WHERE id = ? AND project_id = ?",
+      [TextVal(id), TextVal(project_id)],
+    ),
   )
   Ok(count_from_row(row) > 0)
 }
@@ -427,13 +485,17 @@ pub fn get_blockers(
   list.map(rows, row_to_task) |> result.all
 }
 
-/// Tasks ready for work: not done, not archived and with no incomplete blockers.
-pub fn list_ready(conn: DbConnection) -> Result(List(Task), DbError) {
+/// Tasks ready for work in a project: not done, not archived and with no
+/// incomplete blockers.
+pub fn list_ready(
+  conn: DbConnection,
+  project_id: String,
+) -> Result(List(Task), DbError) {
   let statement =
     "SELECT "
     <> columns_sql()
     <> " FROM tasks "
-    <> "WHERE archived = 0 AND status != 'done' "
+    <> "WHERE project_id = ? AND archived = 0 AND status != 'done' "
     <> "AND id NOT IN ("
     <> "  SELECT d.task_id FROM task_dependencies d "
     <> "  JOIN tasks dep ON dep.id = d.depends_on "
@@ -441,7 +503,9 @@ pub fn list_ready(conn: DbConnection) -> Result(List(Task), DbError) {
     <> ") "
     <> "ORDER BY created_at DESC"
 
-  use rows <- result.try(connection.query(conn, statement, []))
+  use rows <- result.try(
+    connection.query(conn, statement, [TextVal(project_id)]),
+  )
   list.map(rows, row_to_task) |> result.all
 }
 
@@ -477,6 +541,7 @@ fn text_option(value: Value) -> Option(String) {
 
 fn list_filter_sql(filter: TaskFilter) -> String {
   let clauses = [
+    "project_id = ?",
     case filter.archived {
       True -> "archived = 1"
       False -> "archived = 0"
@@ -502,6 +567,7 @@ fn list_filter_sql(filter: TaskFilter) -> String {
 
 fn list_filter_params(filter: TaskFilter) -> List(Value) {
   list.flatten([
+    [TextVal(filter.project_id)],
     case filter.level {
       Some(level) -> [TextVal(level_to_string(level))]
       None -> []
@@ -593,6 +659,7 @@ fn row_to_task(row: List(Value)) -> Result(Task, DbError) {
       archived_raw,
       IntVal(created_at),
       IntVal(updated_at),
+      TextVal(project_id),
     ] -> {
       use level <- result.try(
         level_from_string(level_raw)
@@ -609,7 +676,8 @@ fn row_to_task(row: List(Value)) -> Result(Task, DbError) {
 
       Ok(Task(
         id: id,
-        short_id: short_id,
+        short_id: display_short_id(short_id),
+        project_id: project_id,
         title: title,
         description: description,
         level: level,

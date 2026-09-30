@@ -2,6 +2,14 @@
 ///
 /// Sections are persisted independently from tasks, ordered within their task,
 /// and removed through the task foreign-key cascade.
+///
+/// ### Project scope
+///
+/// `GET /api/v1/tasks/:task_id/sections` is scoped: the task must belong to the
+/// project resolved from `X-Crystalline-Project`, so another project's task is
+/// unreachable through the list. Section creation and the by-id
+/// `/api/v1/sections/:id` routes stay global — they address an explicit task or
+/// section id and are documented as such.
 import gleam/dict.{type Dict}
 import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
@@ -15,6 +23,7 @@ import sacrum_gleam/db/sections as db_sections
 import sacrum_gleam/db/tasks
 import sacrum_gleam/domain/section
 import sacrum_gleam/http/helpers
+import sacrum_gleam/http/project_scope
 import sacrum_gleam/http/router.{type Route, Route}
 import wisp.{type Request, type Response}
 
@@ -45,23 +54,28 @@ pub fn section_routes(conn: DbConnection) -> List(Route) {
 }
 
 fn list_task_sections(
-  _req: Request,
+  req: Request,
   params: Dict(String, String),
   conn: DbConnection,
 ) -> Response {
-  case dict.get(params, "task_id") {
-    Error(_) -> helpers.error_response(400, "Missing task ID")
-    Ok(task_id) ->
-      case tasks.task_exists(conn, task_id) {
-        Error(_) -> helpers.error_response(500, "Failed to check task")
-        Ok(False) -> helpers.error_response(404, "Task not found")
-        Ok(True) ->
-          case db_sections.list_sections(conn, task_id) {
-            Error(_) -> helpers.error_response(500, "Failed to list sections")
-            Ok(sections) -> {
-              let body = json.array(sections, section_to_json)
-              helpers.json_response(json.to_string(body), 200)
-            }
+  case project_scope.resolve(req, conn) {
+    Error(response) -> response
+    Ok(project_id) ->
+      case dict.get(params, "task_id") {
+        Error(_) -> helpers.error_response(400, "Missing task ID")
+        Ok(task_id) ->
+          case tasks.task_in_project_exists(conn, task_id, project_id) {
+            Error(_) -> helpers.error_response(500, "Failed to check task")
+            Ok(False) -> helpers.error_response(404, "Task not found")
+            Ok(True) ->
+              case db_sections.list_sections(conn, task_id) {
+                Error(_) ->
+                  helpers.error_response(500, "Failed to list sections")
+                Ok(sections) -> {
+                  let body = json.array(sections, section_to_json)
+                  helpers.json_response(json.to_string(body), 200)
+                }
+              }
           }
       }
   }

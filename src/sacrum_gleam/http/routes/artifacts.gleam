@@ -2,6 +2,13 @@
 ///
 /// Artifacts are listed by logical name, and PUT always returns 200 whether it
 /// inserts or updates. Path parameters are percent-decoded before database use.
+///
+/// ### Project scope
+///
+/// `GET /api/v1/tasks/:task_id/artifacts` is scoped: the task must belong to
+/// the project resolved from `X-Crystalline-Project`. The by-name
+/// GET/PUT/DELETE routes stay global — they address an explicit task id and
+/// logical name, so a caller that only holds those keeps working.
 import gleam/dict
 import gleam/dynamic/decode
 import gleam/http.{Delete, Get, Put}
@@ -13,6 +20,7 @@ import sacrum_gleam/db/connection.{type DbConnection}
 import sacrum_gleam/db/tasks
 import sacrum_gleam/domain/artifact.{type Artifact, json_decoder}
 import sacrum_gleam/http/helpers
+import sacrum_gleam/http/project_scope
 import sacrum_gleam/http/router.{type Route, Route}
 import wisp.{type Request, type Response}
 
@@ -34,29 +42,35 @@ pub fn artifact_routes(conn: DbConnection) -> List(Route) {
       "/api/v1/tasks/:task_id/artifacts/:logical_name",
       fn(_req, params) { delete_artifact(params, conn) },
     ),
-    Route(Get, "/api/v1/tasks/:task_id/artifacts", fn(_req, params) {
-      list_artifacts(params, conn)
+    Route(Get, "/api/v1/tasks/:task_id/artifacts", fn(req, params) {
+      list_artifacts(req, params, conn)
     }),
   ]
 }
 
 fn list_artifacts(
+  req: Request,
   params: dict.Dict(String, String),
   conn: DbConnection,
 ) -> Response {
-  case task_id_param(params) {
+  case project_scope.resolve(req, conn) {
     Error(response) -> response
-    Ok(task_id) ->
-      case require_task(conn, task_id) {
+    Ok(project_id) ->
+      case task_id_param(params) {
         Error(response) -> response
-        Ok(Nil) ->
-          case artifacts.list_artifacts(conn, task_id) {
-            Error(_) -> helpers.error_response(500, "Failed to list artifacts")
-            Ok(found) ->
-              helpers.json_response(
-                json.to_string(json.array(found, artifact_to_json)),
-                200,
-              )
+        Ok(task_id) ->
+          case require_task_in_project(conn, task_id, project_id) {
+            Error(response) -> response
+            Ok(Nil) ->
+              case artifacts.list_artifacts(conn, task_id) {
+                Error(_) ->
+                  helpers.error_response(500, "Failed to list artifacts")
+                Ok(found) ->
+                  helpers.json_response(
+                    json.to_string(json.array(found, artifact_to_json)),
+                    200,
+                  )
+              }
           }
       }
   }
@@ -177,6 +191,20 @@ fn logical_name_param(
 
 fn require_task(conn: DbConnection, task_id: String) -> Result(Nil, Response) {
   case tasks.task_exists(conn, task_id) {
+    Error(_) -> Error(helpers.error_response(500, "Failed to find task"))
+    Ok(False) -> Error(helpers.error_response(404, "Task not found"))
+    Ok(True) -> Ok(Nil)
+  }
+}
+
+/// Project-scoped variant of `require_task` for the artifact list, which must
+/// not reveal another project's task through its ID.
+fn require_task_in_project(
+  conn: DbConnection,
+  task_id: String,
+  project_id: String,
+) -> Result(Nil, Response) {
+  case tasks.task_in_project_exists(conn, task_id, project_id) {
     Error(_) -> Error(helpers.error_response(500, "Failed to find task"))
     Ok(False) -> Error(helpers.error_response(404, "Task not found"))
     Ok(True) -> Ok(Nil)

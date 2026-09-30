@@ -25,6 +25,22 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `implement_review` / `design_implement` to completion through that table, so
   the omission fails the suite.
 
+## Project scoping
+
+- Task `short_id`s are unique per project, not globally: migration 0003 keeps the
+  0001 inline `short_id UNIQUE` and stores the scoped value
+  `db/tasks.scoped_short_id(project_id, short_id)` (`"<project_id>:<short_id>"`).
+  `Task.short_id` (domain/API) is always the 8-digit display part; do not
+  "simplify" the storage to the display value or inserts collide globally.
+- Do NOT rebuild `tasks` to drop that inline `UNIQUE`: this libsql build enforces
+  foreign keys (`PRAGMA foreign_keys` = 1), so the required `DROP TABLE` cascades
+  over sections/artifacts/flow rows, and `PRAGMA foreign_keys=OFF` is a no-op
+  inside the runner's transaction.
+- Requests resolve their project in `http/project_scope.resolve/2` from
+  `X-Crystalline-Project` (id or slug; absent → `default`; unknown → 404), inside
+  the auth-gated handler. Scoped: task create/list, ready list, sections list,
+  artifacts list. Everything else by-id stays global.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.
