@@ -136,6 +136,31 @@ excessively deep parent chains return 500 rather than looping indefinitely.
 return 409 with the current status; unknown instances return 404. A cancelled
 execution cannot be advanced.
 
+## Projects and scoping
+
+Projects make several workspaces coexist in one database. Every database has a
+sentinel `default` project (id and slug `default`), created by migration 0003,
+which also attributes pre-existing tasks to it.
+
+- `POST /api/v1/projects` creates a project from `slug` and `name`
+  (`description` optional). Slugs are lowercase `[a-z0-9_-]`, at most 64
+  characters, and unique; duplicates return 409 and malformed slugs 400.
+- `GET /api/v1/projects` lists projects; `GET /api/v1/projects/:id` fetches one
+  by id **or** slug (unknown → 404).
+
+Requests choose a project with the `X-Crystalline-Project` header, carrying
+either a project id or its slug. An absent/empty header falls back to the
+`default` project; a header naming no project is rejected with 404 instead of
+falling back. Scoped routes are `POST /api/v1/tasks`, `GET /api/v1/tasks`,
+`GET /api/v1/tasks/ready`, `GET /api/v1/tasks/:task_id/sections` and
+`GET /api/v1/tasks/:task_id/artifacts`. Other task, section and artifact paths
+stay global — they address an explicit id — so clients that only know an id keep
+working. The optional bearer token gate is unchanged and still runs first.
+
+Task `short_id`s are unique **per project**: the same 8-digit id may exist in
+two projects. The stored column keeps the 0001 inline `UNIQUE` and holds the
+scoped form `<project_id>:<short_id>`; the API always returns the 8-digit part.
+
 ## Sections API
 
 Sections belong to a task and are available through these endpoints:
@@ -159,8 +184,8 @@ when unset. Checklist state is `done`, `undone`, or null.
 
 ## Status
 
-Implemented: the domain model, flow engine, database layer, and task, flow,
-execution, and sections HTTP APIs.
+Implemented: the domain model, flow engine, database layer, and task, project,
+flow, execution, and sections HTTP APIs.
 
 Work is tracked as dependency-linked issues so it can be parallelized:
 

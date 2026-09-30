@@ -20,6 +20,7 @@ import sacrum_gleam/domain/execution.{
   StepFailed, StepInProgress,
 }
 import sacrum_gleam/domain/flow.{type FlowInstance, FlowInstance, FlowTemplate}
+import sacrum_gleam/domain/project
 import sacrum_gleam/domain/task.{Medium, Task, Ticket, Todo}
 import sacrum_gleam/http/router
 import sacrum_gleam/http/routes/executions as execution_routes
@@ -43,6 +44,7 @@ fn insert_task(conn: connection.DbConnection, id: String, now: Int) -> Nil {
     Task(
       id: id,
       short_id: "short-" <> id,
+      project_id: project.default_project_id,
       title: "Task " <> id,
       description: "",
       level: Ticket,
