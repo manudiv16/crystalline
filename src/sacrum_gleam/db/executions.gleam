@@ -13,6 +13,7 @@ import sacrum_gleam/domain/execution.{
   Running, StepCancelled, StepCompleted, StepEntered, StepExecution, StepFailed,
   StepInProgress, StepPending, execution_status_to_string, step_status_to_string,
 }
+import sacrum_gleam/runtime/events
 
 /// Execution state and step execution persistence.
 /// Execution state columns (aliased to `es`) joined with the flow instance
@@ -179,17 +180,26 @@ pub fn save_execution_state(
     <> "updated_at = ? WHERE id = ?"
   }
 
-  connection.execute(conn, sql, [
-    connection.TextVal(execution_status_to_string(state.status)),
-    option_to_text(state.current_node_id),
-    connection.TextVal(encode_loop_counters(state.loop_counters)),
-    connection.TextVal(encode_variables(state.variables)),
-    connection.TextVal(encode_parallel_active(state.parallel_active)),
-    int_option_to_val(state.started_at),
-    int_option_to_val(state.completed_at),
-    connection.IntVal(now),
-    connection.TextVal(state.id),
-  ])
+  use _ <- result.try(
+    connection.execute(conn, sql, [
+      connection.TextVal(execution_status_to_string(state.status)),
+      option_to_text(state.current_node_id),
+      connection.TextVal(encode_loop_counters(state.loop_counters)),
+      connection.TextVal(encode_variables(state.variables)),
+      connection.TextVal(encode_parallel_active(state.parallel_active)),
+      int_option_to_val(state.started_at),
+      int_option_to_val(state.completed_at),
+      connection.IntVal(now),
+      connection.TextVal(state.id),
+    ]),
+  )
+  events.publish_execution_status(
+    state.id,
+    state.status,
+    state.current_node_id,
+    now,
+  )
+  Ok(Nil)
 }
 
 /// Atomically claim the oldest pending or running execution whose lease is
@@ -272,7 +282,9 @@ pub fn update_execution_status(
     connection.TextVal(id),
   ]
 
-  connection.execute(conn, sql, params)
+  use _ <- result.try(connection.execute(conn, sql, params))
+  events.publish_execution_status(id, status, current_node_id, now)
+  Ok(Nil)
 }
 
 /// Persist the full execution lifecycle in one write: status, current node and
@@ -397,7 +409,9 @@ pub fn update_step_execution(
     connection.TextVal(step.id),
   ]
 
-  connection.execute(conn, sql, params)
+  use _ <- result.try(connection.execute(conn, sql, params))
+  events.publish_step_status(step)
+  Ok(Nil)
 }
 
 pub fn get_step_execution(
