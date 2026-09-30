@@ -15,6 +15,7 @@ import sacrum_gleam/config
 import sacrum_gleam/db/connection
 import sacrum_gleam/db/migrations
 import sacrum_gleam/http/router
+import sacrum_gleam/http/routes/artifacts
 import sacrum_gleam/http/routes/executions
 import sacrum_gleam/http/routes/flow_templates
 import sacrum_gleam/http/routes/flows
@@ -61,6 +62,7 @@ pub fn all_routes(
   |> list.append(flow_templates.flow_template_routes(conn))
   |> list.append(flows.flow_routes(conn))
   |> list.append(sections.section_routes(conn))
+  |> list.append(artifacts.artifact_routes(conn))
 }
 
 /// Resolve the database configuration from the environment, connect, and
