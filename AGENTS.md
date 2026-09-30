@@ -15,8 +15,8 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   bugs. Rationale and details: README "Development" and
   `docs/adr/001-embedded-crystalline-gleam-libsql.md`.
 - `gleam format --check src test` reports pre-existing drift in
-  `src/sacrum_gleam/http/routes/flows.gleam`, `test/flows_test.gleam` and
-  `test/debug_flows_test.gleam`.
+  `test/debug_flows_test.gleam` only. `gleam format <file>` rewrites a whole
+  file, so on a file that still drifts it also reformats the untouched parts.
 - The live server and the test suite share one route table,
   `server.all_routes(conn, db_mode)` (`src/sacrum_gleam/http/server.gleam`).
   A new HTTP route MUST be added there, not only to its
@@ -72,6 +72,12 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 - The stream route accepts the API token as `?token=` on top of the bearer
   header, because `EventSource` cannot set headers; every other route stays
   header-only.
+- A conversational human turn (`http/routes/flows.reply_service`) is two
+  session-log appends on the gate node's step execution — event types `prompt`
+  then `human_input` (`db/session_logs.prompt_event_type`/`human_input_event_type`,
+  sequences `n`/`n + 1`) — so it is visible as `session_log` events keyed by
+  **that step execution id**, never by the flow's `exec-*` id: the registry fans
+  out per id and does not roll steps up to their execution.
 
 ## Maintaining this file
 

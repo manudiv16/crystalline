@@ -29,8 +29,37 @@
 ///     POST   /api/v1/flows/:instance_id/advance   next engine step (Action)
 ///     POST   /api/v1/flows/:instance_id/complete  report step output (Action)
 ///     POST   /api/v1/flows/:instance_id/input     resume from awaiting_input (Action)
+///     POST   /api/v1/flows/:instance_id/reply     one human-input conversation turn (Action)
 ///     POST   /api/v1/flows/:instance_id/reject    mark execution rejected
 ///     POST   /api/v1/flows/:instance_id/cancel    cancel a running execution
+///     GET    /api/v1/flows/:instance_id/conversation  the human turns, in order
+///
+/// ## Conversational human input (issue #21)
+///
+/// `reply` is the multi-turn counterpart of `input`: the client posts one
+/// human message and the server records the turn, feeds it through the same
+/// input path as `/input` and reports the resulting `{execution, action}`
+/// envelope, so a client loop never has to call `advance` itself. When the flow
+/// parks on another human node the returned action is `await_input` and the
+/// persisted status is `awaiting_input` — the same pairing `/advance` produces.
+///
+/// A turn is persisted on a step execution created for the gate node, using the
+/// session-log event types documented in `db/session_logs`
+/// ([`session_logs.prompt_event_type`] then
+/// [`session_logs.human_input_event_type`], sequences `n` and `n + 1`). Both
+/// appends go through `db/session_logs.append_log`, so the turn is published on
+/// the execution-event stream as `session_log` events keyed by the gate step
+/// execution id — the same write point `/executions/:id/logs` reads, no second
+/// history store and no second publish path.
+///
+/// The transcript is therefore readable three ways, all of them the same rows:
+/// `GET /api/v1/executions/:gate_step_id/logs` (paged by `before_sequence`, for
+/// one turn), `GET /api/v1/flows/:instance_id/conversation` (all gates of the
+/// instance in conversation order) and the `session_log` stream events.
+/// `conversation` exists because `/logs` is keyed by step execution id and a
+/// client driving a conversation would otherwise have to learn and track one
+/// step id per turn; it adds no storage, it only joins the same `session_logs`
+/// rows to their gate node.
 ///
 /// The pure flow engine (`flow/engine`, `flow/executor`) is stateless per
 /// request: the database owns the execution state, and each call hydrates a
@@ -49,11 +78,13 @@ import gleam/string
 import sacrum_gleam/db/connection.{type DbConnection, type DbError}
 import sacrum_gleam/db/executions
 import sacrum_gleam/db/flows
+import sacrum_gleam/db/session_logs
 import sacrum_gleam/db/tasks
 import sacrum_gleam/domain/execution.{
   type ExecutionState, AwaitingInput, Cancelled, Completed, ExecutionState,
   Failed, Pending, Rejected, Running, StepCompleted, StepExecution,
-  execution_status_to_string, new_execution_state, with_lifecycle,
+  StepInProgress, execution_status_to_string, new_execution_state,
+  with_lifecycle,
 }
 import sacrum_gleam/domain/flow.{
   type FlowInstance, type FlowTemplate, type Transition, FlowInstance,
@@ -124,6 +155,12 @@ pub fn flow_routes(conn: DbConnection) -> List(Route) {
     }),
     Route(Post, "/api/v1/flows/:instance_id/input", fn(req, params) {
       input(req, params, conn)
+    }),
+    Route(Post, "/api/v1/flows/:instance_id/reply", fn(req, params) {
+      reply(req, params, conn)
+    }),
+    Route(Get, "/api/v1/flows/:instance_id/conversation", fn(req, params) {
+      conversation(req, params, conn)
     }),
     Route(Post, "/api/v1/flows/:instance_id/reject", fn(req, params) {
       reject(req, params, conn)
@@ -391,6 +428,63 @@ fn input(
   }
 }
 
+/// POST /api/v1/flows/:instance_id/reply — one conversational human turn.
+///
+/// `{"message": "..."}` must be non-blank; an invalid body is rejected before
+/// anything is loaded or written.
+fn reply(
+  req: Request,
+  params: Dict(String, String),
+  conn: DbConnection,
+) -> Response {
+  use body <- wisp.require_json(req)
+
+  case dict.get(params, "instance_id") {
+    Error(Nil) -> helpers.error_response(400, "Missing instance ID")
+    Ok(instance_id) ->
+      case decode_string_field(body, "message") {
+        Error(message) -> helpers.error_response(400, message)
+        Ok(message) ->
+          case string.trim(message) {
+            "" -> helpers.error_response(400, "Message must not be empty")
+            _ ->
+              case reply_service(conn, instance_id, message) {
+                Error(error) -> execution_error_response(error)
+                Ok(#(state, action)) ->
+                  helpers.json_response(
+                    json.to_string(execution_step_body(state, action)),
+                    200,
+                  )
+              }
+          }
+      }
+  }
+}
+
+/// GET /api/v1/flows/:instance_id/conversation — the instance's human turns.
+///
+/// Returns the `prompt`/`human_input` session logs of every gate step in
+/// conversation order. Reading the same rows through
+/// `/api/v1/executions/:step_id/logs` stays the paged, per-turn view.
+fn conversation(
+  _req: Request,
+  params: Dict(String, String),
+  conn: DbConnection,
+) -> Response {
+  case dict.get(params, "instance_id") {
+    Error(Nil) -> helpers.error_response(400, "Missing instance ID")
+    Ok(instance_id) ->
+      case conversation_service(conn, instance_id) {
+        Error(error) -> execution_error_response(error)
+        Ok(turns) ->
+          helpers.json_response(
+            json.to_string(json.array(turns, turn_log_body)),
+            200,
+          )
+      }
+  }
+}
+
 fn reject(
   _req: Request,
   params: Dict(String, String),
@@ -595,9 +689,7 @@ pub fn delete_template_service(
   case count > 0 {
     True ->
       Error(Conflict(
-        "Flow template is in use by "
-        <> int.to_string(count)
-        <> " instance(s)",
+        "Flow template is in use by " <> int.to_string(count) <> " instance(s)",
       ))
     False ->
       flows.delete_flow_template(conn, id)
@@ -637,17 +729,17 @@ pub fn add_transition_service(
   })
   use transition <- result.try(
     decode.run(body, codec.transition_decoder())
-    |> result.map_error(fn(_errors) {
-      BadRequest("Invalid transition body")
-    }),
+    |> result.map_error(fn(_errors) { BadRequest("Invalid transition body") }),
   )
 
-  use _ <- result.try(case
-    list.any(template.transitions, fn(stored) { stored.id == transition.id })
-  {
-    True -> Error(Conflict("Transition already exists: " <> transition.id))
-    False -> Ok(Nil)
-  })
+  use _ <- result.try(
+    case
+      list.any(template.transitions, fn(stored) { stored.id == transition.id })
+    {
+      True -> Error(Conflict("Transition already exists: " <> transition.id))
+      False -> Ok(Nil)
+    },
+  )
 
   let updated =
     FlowTemplate(
@@ -682,12 +774,14 @@ pub fn remove_transition_service(
     Ok(template) -> Ok(template)
     Error(_) -> Error(NotFound("Flow template not found: " <> template_id))
   })
-  use _ <- result.try(case
-    list.any(template.transitions, fn(stored) { stored.id == transition_id })
-  {
-    False -> Error(NotFound("Transition not found: " <> transition_id))
-    True -> Ok(Nil)
-  })
+  use _ <- result.try(
+    case
+      list.any(template.transitions, fn(stored) { stored.id == transition_id })
+    {
+      False -> Error(NotFound("Transition not found: " <> transition_id))
+      True -> Ok(Nil)
+    },
+  )
 
   let updated =
     FlowTemplate(
@@ -929,6 +1023,13 @@ pub fn complete_service(
 }
 
 /// Resume an execution parked at `awaiting_input` with the supplied input.
+///
+/// The input walks the graph to its next actionable node: an agent step
+/// (`running`, `run_step`), another human gate (`awaiting_input`,
+/// `await_input` — the executor only flips that status in `advance`, so it is
+/// applied here too, otherwise the persisted row would claim `running` while
+/// the reported action waits for a human), or the end of the flow
+/// (`completed`, `flow_complete`).
 pub fn input_service(
   conn: DbConnection,
   instance_id: String,
@@ -947,9 +1048,127 @@ pub fn input_service(
   })
 
   let result = executor_provide_input(state, input_value)
+  let next_state = case result.action {
+    AwaitInput(_) -> ExecutionState(..result.state, status: AwaitingInput)
+    _ -> result.state
+  }
 
-  use persisted <- result.try(persist_state(conn, result.state))
+  use persisted <- result.try(persist_state(conn, next_state))
   Ok(#(persisted, result.action))
+}
+
+/// Record and answer one human turn of an `awaiting_input` execution.
+///
+/// The turn is persisted before the engine is driven, and every write goes
+/// through the existing db functions, so a successful turn is durable even if
+/// the following transition reports an error, and the appends are published on
+/// the execution-event stream (`session_log` keyed by the gate step).
+///
+/// The turn's step execution is created with status `in_progress`: the gate is
+/// still the node the execution is parked on when the reply arrives, and
+/// `in_progress` keeps it out of `flow/executor.get_completed_children`, so
+/// recording a gate never changes which composite children the engine considers
+/// done.
+///
+/// The reply then follows exactly the `/input` path (`input_service`), so the
+/// resulting `{execution, action}` matches the single-shot API: `await_input`
+/// with `awaiting_input` when another human turn is needed, `run_step` when an
+/// agent step is next, `flow_complete` when the reply ends the flow.
+pub fn reply_service(
+  conn: DbConnection,
+  instance_id: String,
+  message: String,
+) -> Result(#(ExecutionState, Action), ExecutionError) {
+  use state <- result.try(load_execution(conn, instance_id))
+
+  use _ <- result.try(case state.status {
+    AwaitingInput -> Ok(Nil)
+    _ ->
+      Error(Conflict(
+        "Cannot reply: execution is "
+        <> execution_status_to_string(state.status),
+      ))
+  })
+
+  use node_id <- result.try(case state.current_node_id {
+    Some(id) -> Ok(id)
+    None -> Error(Conflict("Execution has no current node"))
+  })
+  use node <- result.try(case dict.get(state.flow_instance.nodes, node_id) {
+    Ok(node) -> Ok(node)
+    Error(Nil) ->
+      Error(Internal("Current node missing from the flow snapshot: " <> node_id))
+  })
+
+  let now = milliseconds_now()
+  let prompt = unwrap(node.prompt, node.goal)
+  let step =
+    StepExecution(
+      id: new_id("step"),
+      flow_instance_id: instance_id,
+      execution_state_id: state.id,
+      node_id: node_id,
+      task_id: state.task_id,
+      status: StepInProgress,
+      prompt: Some(prompt),
+      output: None,
+      transition_result: None,
+      model: None,
+      input_tokens: 0,
+      output_tokens: 0,
+      cost: 0.0,
+      duration_ms: 0,
+      session_id: None,
+      created_at: now,
+      completed_at: None,
+    )
+  use _ <- result.try(internal_error(
+    executions.create_step_execution(conn, step, now)
+    |> db_to_message,
+  ))
+  use _ <- result.try(internal_error(
+    session_logs.append_log(
+      conn,
+      step.id,
+      state.task_id,
+      session_logs.prompt_event_type,
+      prompt,
+      now,
+    )
+    |> db_to_message,
+  ))
+  use _ <- result.try(internal_error(
+    session_logs.append_log(
+      conn,
+      step.id,
+      state.task_id,
+      session_logs.human_input_event_type,
+      message,
+      now,
+    )
+    |> db_to_message,
+  ))
+
+  input_service(conn, instance_id, message)
+}
+
+/// Read an instance's human turns, in conversation order.
+///
+/// The instance must exist (404 otherwise) even when it has no turns yet, so a
+/// client can tell "nothing said yet" from "wrong id".
+pub fn conversation_service(
+  conn: DbConnection,
+  instance_id: String,
+) -> Result(List(session_logs.TurnLog), ExecutionError) {
+  use _ <- result.try(
+    case executions.get_execution_by_instance(conn, instance_id) {
+      Ok(_state) -> Ok(Nil)
+      Error(_) -> Error(NotFound("Flow instance not found: " <> instance_id))
+    },
+  )
+  session_logs.list_human_turns(conn, instance_id)
+  |> db_to_message
+  |> result.map_error(Internal)
 }
 
 /// Mark an execution as rejected.
@@ -1175,6 +1394,19 @@ fn execution_step_body(state: ExecutionState, action: Action) -> json.Json {
   json.object([
     #("execution", execution_body(state)),
     #("action", action_body(action)),
+  ])
+}
+
+/// One conversational turn row: the payload is plain text (the prompt asked or
+/// the message said), and `node_id` names the gate it belongs to.
+fn turn_log_body(turn: session_logs.TurnLog) -> json.Json {
+  json.object([
+    #("step_execution_id", json.string(turn.log.step_execution_id)),
+    #("node_id", json.string(turn.node_id)),
+    #("event_type", json.string(turn.log.event_type)),
+    #("payload", json.string(turn.log.payload)),
+    #("sequence", json.int(turn.log.sequence)),
+    #("created_at", json.int(turn.log.created_at)),
   ])
 }
 
