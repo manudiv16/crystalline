@@ -1,3 +1,14 @@
+/// Task CRUD, dependency, and hierarchy-path HTTP endpoints.
+///
+/// ### Project scope
+///
+/// `POST /api/v1/tasks`, `GET /api/v1/tasks` and `GET /api/v1/tasks/ready` are
+/// scoped to the project resolved from `X-Crystalline-Project` (absent → the
+/// sentinel `default` project; unknown → 404). Every other task path
+/// (`GET/PATCH/DELETE /api/v1/tasks/:id`, `/path`, `/blockers`, dependency
+/// add/remove) stays **global**: a task is addressable by its id regardless of
+/// the request's project header, which keeps CLI/mobile flows that only know an
+/// id working. The task JSON carries `project_id` so callers can see the owner.
 import gleam/dict.{type Dict}
 import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
@@ -12,6 +23,7 @@ import sacrum_gleam/db/connection.{type DbConnection}
 import sacrum_gleam/db/tasks
 import sacrum_gleam/domain/task
 import sacrum_gleam/http/helpers
+import sacrum_gleam/http/project_scope
 import sacrum_gleam/http/router.{type Route, Route}
 import wisp.{type Request, type Response}
 
@@ -24,6 +36,9 @@ pub fn task_routes(conn: DbConnection) -> List(Route) {
     Route(Get, "/api/v1/tasks", fn(req, _) { list_tasks(req, conn) }),
     Route(Get, "/api/v1/tasks/:id", fn(req, params) {
       get_task(req, params, conn)
+    }),
+    Route(Get, "/api/v1/tasks/:id/path", fn(req, params) {
+      get_task_path(req, params, conn)
     }),
     Route(Patch, "/api/v1/tasks/:id", fn(req, params) {
       update_task(req, params, conn)
@@ -48,6 +63,17 @@ pub fn task_routes(conn: DbConnection) -> List(Route) {
 fn create_task(req: Request, conn: DbConnection) -> Response {
   use body <- wisp.require_json(req)
 
+  case project_scope.resolve(req, conn) {
+    Error(response) -> response
+    Ok(project_id) -> create_task_in_project(body, project_id, conn)
+  }
+}
+
+fn create_task_in_project(
+  body: Dynamic,
+  project_id: String,
+  conn: DbConnection,
+) -> Response {
   // Decode required fields
   let title_result = decode_string_field(body, "title")
   let level_result = decode_string_field(body, "level")
@@ -68,7 +94,7 @@ fn create_task(req: Request, conn: DbConnection) -> Response {
 
           // Generate IDs
           let id = generate_uuid()
-          let short_id = generate_unique_short_id(conn)
+          let short_id = generate_unique_short_id(conn, project_id)
           let now = get_current_timestamp()
 
           // Create task
@@ -76,6 +102,7 @@ fn create_task(req: Request, conn: DbConnection) -> Response {
             task.Task(
               id: id,
               short_id: short_id,
+              project_id: project_id,
               title: title,
               description: description,
               level: level,
@@ -108,6 +135,17 @@ fn create_task(req: Request, conn: DbConnection) -> Response {
 // ─── GET /api/v1/tasks ────────────────────────────────────────────────────
 
 fn list_tasks(req: Request, conn: DbConnection) -> Response {
+  case project_scope.resolve(req, conn) {
+    Error(response) -> response
+    Ok(project_id) -> list_tasks_in_project(req, project_id, conn)
+  }
+}
+
+fn list_tasks_in_project(
+  req: Request,
+  project_id: String,
+  conn: DbConnection,
+) -> Response {
   let query = wisp.get_query(req)
 
   // Parse filters from query params
@@ -154,6 +192,7 @@ fn list_tasks(req: Request, conn: DbConnection) -> Response {
 
   let filter =
     tasks.TaskFilter(
+      project_id: project_id,
       level: level,
       status: status,
       parent_id: parent_id,
@@ -186,6 +225,34 @@ fn get_task(
         Ok(t) -> helpers.json_response(json.to_string(task_to_json(t)), 200)
       }
     }
+  }
+}
+
+// ─── GET /api/v1/tasks/:id/path ───────────────────────────────────────────
+
+fn get_task_path(
+  _req: Request,
+  params: Dict(String, String),
+  conn: DbConnection,
+) -> Response {
+  case dict.get(params, "id") {
+    Error(_) -> helpers.error_response(400, "Missing task ID")
+    Ok(id) ->
+      case tasks.get_task_path(conn, id) {
+        Error(tasks.TaskPathNotFound) ->
+          helpers.error_response(404, "Task not found")
+        Error(tasks.TaskPathCycle) ->
+          helpers.error_response(500, "Cycle detected in task parent_id path")
+        Error(tasks.TaskPathTooDeep) ->
+          helpers.error_response(500, "Task hierarchy exceeds maximum depth")
+        Error(tasks.TaskPathDatabaseError(_)) ->
+          helpers.error_response(500, "Failed to load task hierarchy")
+        Ok(path) -> {
+          let response_json =
+            json.object([#("path", json.array(path, task_to_json))])
+          helpers.json_response(json.to_string(response_json), 200)
+        }
+      }
   }
 }
 
@@ -358,13 +425,17 @@ fn get_blockers(
 
 // ─── GET /api/v1/tasks/ready ──────────────────────────────────────────────
 
-fn list_ready_tasks(_req: Request, conn: DbConnection) -> Response {
-  case tasks.list_ready(conn) {
-    Error(_) -> helpers.error_response(500, "Failed to list ready tasks")
-    Ok(ts) -> {
-      let tasks_json = json.array(ts, task_to_json)
-      helpers.json_response(json.to_string(tasks_json), 200)
-    }
+fn list_ready_tasks(req: Request, conn: DbConnection) -> Response {
+  case project_scope.resolve(req, conn) {
+    Error(response) -> response
+    Ok(project_id) ->
+      case tasks.list_ready(conn, project_id) {
+        Error(_) -> helpers.error_response(500, "Failed to list ready tasks")
+        Ok(ts) -> {
+          let tasks_json = json.array(ts, task_to_json)
+          helpers.json_response(json.to_string(tasks_json), 200)
+        }
+      }
   }
 }
 
@@ -407,6 +478,7 @@ fn task_to_json(t: task.Task) -> json.Json {
   json.object([
     #("id", json.string(t.id)),
     #("short_id", json.string(t.short_id)),
+    #("project_id", json.string(t.project_id)),
     #("title", json.string(t.title)),
     #("description", json.string(t.description)),
     #("level", json.string(task.level_to_string(t.level))),
@@ -529,11 +601,12 @@ pub fn generate_short_id() -> String {
   string.pad_start(int.to_string(random), 8, "0")
 }
 
-/// Generate an 8-digit short ID that does not collide with an existing task.
-fn generate_unique_short_id(conn: DbConnection) -> String {
+/// Generate an 8-digit short ID that does not collide with an existing task in
+/// the same project. The same user-visible id may be reused in another project.
+fn generate_unique_short_id(conn: DbConnection, project_id: String) -> String {
   let candidate = generate_short_id()
-  case tasks.short_id_exists(conn, candidate) {
-    Ok(True) -> generate_unique_short_id(conn)
+  case tasks.short_id_exists(conn, project_id, candidate) {
+    Ok(True) -> generate_unique_short_id(conn, project_id)
     _ -> candidate
   }
 }

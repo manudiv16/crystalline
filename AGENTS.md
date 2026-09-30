@@ -15,7 +15,69 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   bugs. Rationale and details: README "Development" and
   `docs/adr/001-embedded-crystalline-gleam-libsql.md`.
 - `gleam format --check src test` reports pre-existing drift in
-  `test/flows_test.gleam` and `test/debug_flows_test.gleam`.
+  `test/debug_flows_test.gleam` only. `gleam format <file>` rewrites a whole
+  file, so on a file that still drifts it also reformats the untouched parts.
+- The live server and the test suite share one route table,
+  `server.all_routes(conn, db_mode)` (`src/sacrum_gleam/http/server.gleam`).
+  A new HTTP route MUST be added there, not only to its
+  `http/routes/*` module: routes that are missing from the table exist as
+  handlers but 404 on a live server. `test/e2e_test.gleam` drives
+  `implement_review` / `design_implement` to completion through that table, so
+  the omission fails the suite.
+
+## Flow graph rules
+
+- `flow/validator.validate` rejects a transition whose `from_id == to_id` for
+  every node type, `Loop` and `Branch` included: the engine never follows a
+  self-edge (loops iterate `loop_config.child_ids` + their iteration counter,
+  branches dispatch their `branch_rules`), so one can only make
+  `find_next_node` re-dispatch the same node forever. Do not re-add a `Loop`/
+  `Branch` exception without changing `flow/executor.gleam` first.
+- A cycle is legal only while it crosses a `Branch` (rules are re-evaluated on
+  every pass — the shipped `review_gate` loops `gate_branch → fix → re_review →
+  gate_branch` and exits to `done`) or a `Loop` (bounded by `loop_config`).
+  Cycles made only of step/composite nodes stay rejected.
+- Every shipped template must pass `validator.validate`: the daemon restores
+  persisted templates through `flow_engine.register_template`, which runs that
+  validator and silently skips what it rejects. Guarded by
+  `test/flow_templates_test.gleam` (spec-by-spec, plus `seed_to_engine`).
+
+## Project scoping
+
+- Task `short_id`s are unique per project, not globally: migration 0003 keeps the
+  0001 inline `short_id UNIQUE` and stores the scoped value
+  `db/tasks.scoped_short_id(project_id, short_id)` (`"<project_id>:<short_id>"`).
+  `Task.short_id` (domain/API) is always the 8-digit display part; do not
+  "simplify" the storage to the display value or inserts collide globally.
+- Do NOT rebuild `tasks` to drop that inline `UNIQUE`: this libsql build enforces
+  foreign keys (`PRAGMA foreign_keys` = 1), so the required `DROP TABLE` cascades
+  over sections/artifacts/flow rows, and `PRAGMA foreign_keys=OFF` is a no-op
+  inside the runner's transaction.
+- Requests resolve their project in `http/project_scope.resolve/2` from
+  `X-Crystalline-Project` (id or slug; absent → `default`; unknown → 404), inside
+  the auth-gated handler. Scoped: task create/list, ready list, sections list,
+  artifacts list. Everything else by-id stays global.
+## Real-time execution updates
+
+- The SSE route `GET /api/v1/executions/:id/events` is deliberately **not** in
+  `all_routes`: `wisp_mist` can only pass `Text`/`Bytes`/`File` bodies, so
+  `server.start/1` dispatches that path to a dedicated Mist branch
+  (`src/sacrum_gleam/http/execution_stream.gleam`, using
+  `mist.server_sent_events`). Adding it to `all_routes` cannot work.
+- Events are published from the persistence write points
+  (`db/session_logs.append_log`, `db/executions.update_step_execution`,
+  `update_execution_status`, `save_execution_state`) into the in-BEAM registry in
+  `src/sacrum_gleam/runtime/events.gleam`; new execution writers must publish
+  there to be visible on the stream.
+- The stream route accepts the API token as `?token=` on top of the bearer
+  header, because `EventSource` cannot set headers; every other route stays
+  header-only.
+- A conversational human turn (`http/routes/flows.reply_service`) is two
+  session-log appends on the gate node's step execution — event types `prompt`
+  then `human_input` (`db/session_logs.prompt_event_type`/`human_input_event_type`,
+  sequences `n`/`n + 1`) — so it is visible as `session_log` events keyed by
+  **that step execution id**, never by the flow's `exec-*` id: the registry fans
+  out per id and does not roll steps up to their execution.
 
 ## Maintaining this file
 

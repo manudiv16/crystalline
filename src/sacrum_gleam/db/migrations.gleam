@@ -138,8 +138,45 @@ fn split_statements(sql: String) -> List(String) {
 
 /// The built-in migrations, embedded at compile time.
 pub fn builtin_migrations() -> List(Migration) {
-  [Migration(version: 1, name: "init", sql: init_sql)]
+  [
+    Migration(version: 1, name: "init", sql: init_sql),
+    Migration(version: 2, name: "daemon_claims", sql: daemon_claims_sql),
+    Migration(version: 3, name: "projects", sql: projects_sql),
+  ]
 }
+
+/// SQL from `migrations/0003_projects.sql`, embedded for runtime use.
+///
+/// `tasks.short_id` keeps the inline `UNIQUE` declared in 0001: SQLite cannot
+/// drop an inline constraint without rebuilding the table, and this build
+/// enforces foreign keys, so the required `DROP TABLE tasks` would cascade
+/// over every child row (sections, artifacts, flow instances, executions…).
+/// Instead the constraint is kept and *scoped*: stored short ids are
+/// `<project_id>:<short_id>` (see `db/tasks.scoped_short_id`), so two projects
+/// can share the same user-visible 8-digit id without a rebuild. Existing rows
+/// are attributed to the sentinel `default` project and their ids rewritten to
+/// match, which is why the backfill is included here rather than left to code.
+const projects_sql: String = "-- Migration 0003: projects and task project scoping
+CREATE TABLE IF NOT EXISTS projects (
+    id          TEXT PRIMARY KEY,
+    slug        TEXT NOT NULL UNIQUE,
+    name        TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_projects_slug ON projects(slug);
+INSERT OR IGNORE INTO projects (id, slug, name, description, created_at, updated_at) VALUES ('default', 'default', 'Default Project', '', CAST(strftime('%s', 'now') AS INTEGER), CAST(strftime('%s', 'now') AS INTEGER));
+ALTER TABLE tasks ADD COLUMN project_id TEXT NOT NULL DEFAULT 'default';
+UPDATE tasks SET short_id = 'default:' || short_id;
+CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);"
+
+/// SQL from `migrations/0002_daemon_claims.sql`, embedded for runtime use.
+const daemon_claims_sql: String = "-- Migration 0002: daemon execution claims
+ALTER TABLE execution_states ADD COLUMN claimed_by TEXT;
+ALTER TABLE execution_states ADD COLUMN claimed_at INTEGER;
+CREATE INDEX IF NOT EXISTS idx_exec_states_claim
+  ON execution_states(status, claimed_at, created_at);"
 
 /// SQL from `migrations/0001_init.sql`, embedded at compile time.
 const init_sql: String = "-- Migration 0001: Initial schema for embedded Sacrum

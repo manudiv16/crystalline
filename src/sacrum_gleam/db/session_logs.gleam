@@ -4,6 +4,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import sacrum_gleam/db/connection.{type DbConnection, type DbError}
 import sacrum_gleam/domain/session.{type SessionLog, SessionLog}
+import sacrum_gleam/runtime/events
 
 /// Session log persistence for step executions.
 ///
@@ -23,13 +24,29 @@ pub const default_limit: Int = 50
 /// Event types accepted on append. The runtime step executor emits
 /// `outcome`, `usage` and `error`; `text` and `tool_use` are part of the
 /// harness event vocabulary (see `migrations/0001_init.sql`).
+///
+/// The conversational human-input channel ([`human_turn_event_types`]) adds
+/// `prompt` and `human_input`: one human turn appends the gate node's prompt
+/// and then the human's reply to the same step execution, so a step's log
+/// stream replays a turn in order (prompt at sequence `n`, reply at `n + 1`).
+/// The payload of both types is the plain text, not JSON.
 pub const allowed_event_types: List(String) = [
   "text",
   "usage",
   "tool_use",
   "outcome",
   "error",
+  "prompt",
+  "human_input",
 ]
+
+/// The subset of [`allowed_event_types`](#allowed_event_types) that carries a
+/// conversational human turn (see `http/routes/flows.reply_service`).
+pub const human_turn_event_types: List(String) = ["prompt", "human_input"]
+
+pub const prompt_event_type: String = "prompt"
+
+pub const human_input_event_type: String = "human_input"
 
 /// Whether `event_type` is one of the accepted log event types.
 pub fn is_valid_event_type(event_type: String) -> Bool {
@@ -92,6 +109,9 @@ pub fn append_log(
   case outcome {
     Ok(log) -> {
       use _ <- result.try(connection.execute(conn, "COMMIT", []))
+      // Publish only after the row is committed, so a stream never sees an
+      // append that the database rejected or rolled back.
+      events.publish_session_log(log)
       Ok(log)
     }
     Error(error) -> {
@@ -149,6 +169,95 @@ pub fn list_logs(
   use logs <- result.try(list.map(rows, row_to_log) |> result.all)
   // Newest-first selection, but the page itself keeps chronological order.
   Ok(list.reverse(logs))
+}
+
+/// One human-turn log row plus the gate node it belongs to.
+///
+/// The node id is not on `SessionLog` (the log only knows its step execution);
+/// it is joined in so a client can name the gate a prompt or reply came from.
+pub type TurnLog {
+  TurnLog(log: SessionLog, node_id: String)
+}
+
+/// List every human-turn log of a flow instance, in conversation order.
+///
+/// Both `prompt` and `human_input` rows are returned (see
+/// [`human_turn_event_types`](#human_turn_event_types)); other event types —
+/// agent `outcome`/`usage`/`text` rows — are excluded, so the result is the
+/// transcript of the gates and not the whole step history.
+///
+/// Order is `step_executions.rowid`, then the per-step `sequence`: rowid is the
+/// insertion order of the gate step executions, which is the order the turns
+/// happened in. `created_at` alone cannot carry that order — two turns taken in
+/// the same millisecond would be indistinguishable — and the per-step sequence
+/// is assigned inside the append transaction.
+pub fn list_human_turns(
+  conn: DbConnection,
+  flow_instance_id: String,
+) -> Result(List(TurnLog), DbError) {
+  let sql = {
+    "SELECT sl.id, sl.step_execution_id, sl.task_id, sl.event_type, "
+    <> "sl.payload_json, sl.sequence, sl.created_at, se.node_id "
+    <> "FROM session_logs sl "
+    <> "JOIN step_executions se ON se.id = sl.step_execution_id "
+    <> "WHERE se.flow_instance_id = ? "
+    <> "AND sl.event_type IN ('prompt', 'human_input') "
+    <> "ORDER BY se.rowid, sl.sequence"
+  }
+
+  use rows <- result.try(
+    connection.query(conn, sql, [connection.TextVal(flow_instance_id)]),
+  )
+  use turns <- result.try(list.map(rows, row_to_turn_log) |> result.all)
+  Ok(turns)
+}
+
+fn row_to_turn_log(row: List(connection.Value)) -> Result(TurnLog, DbError) {
+  case row {
+    [
+      connection.TextVal(id),
+      connection.TextVal(step_execution_id),
+      connection.TextVal(task_id),
+      connection.TextVal(event_type),
+      connection.TextVal(payload_json),
+      connection.IntVal(sequence),
+      connection.IntVal(created_at),
+      connection.TextVal(node_id),
+    ] ->
+      Ok(TurnLog(
+        log: SessionLog(
+          id: id,
+          step_execution_id: step_execution_id,
+          task_id: task_id,
+          event_type: event_type,
+          payload: payload_json,
+          sequence: sequence,
+          created_at: created_at,
+        ),
+        node_id: node_id,
+      ))
+    _ -> Error(connection.QueryError("Invalid human turn log row"))
+  }
+}
+
+/// Whether any step in a flow instance already has a durable error event.
+pub fn has_error_log_for_instance(
+  conn: DbConnection,
+  flow_instance_id: String,
+) -> Result(Bool, DbError) {
+  use row <- result.try(
+    connection.query_one(
+      conn,
+      "SELECT COUNT(*) FROM session_logs sl "
+        <> "JOIN step_executions se ON se.id = sl.step_execution_id "
+        <> "WHERE se.flow_instance_id = ? AND sl.event_type = 'error'",
+      [connection.TextVal(flow_instance_id)],
+    ),
+  )
+  case row {
+    [connection.IntVal(count), ..] -> Ok(count > 0)
+    _ -> Error(connection.QueryError("Could not count execution error logs"))
+  }
 }
 
 /// Delete every log event belonging to a step execution.

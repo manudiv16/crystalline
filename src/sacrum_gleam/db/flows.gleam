@@ -145,6 +145,16 @@ pub fn delete_flow_template(
   connection.execute(conn, sql, [connection.TextVal(id)])
 }
 
+/// Delete a flow instance. Related execution, step and session rows cascade.
+pub fn delete_flow_instance(
+  conn: DbConnection,
+  id: String,
+) -> Result(Nil, DbError) {
+  connection.execute(conn, "DELETE FROM flow_instances WHERE id = ?", [
+    connection.TextVal(id),
+  ])
+}
+
 /// Number of flow instances created from a template. Used to decide whether
 /// a template can be deleted.
 pub fn count_instances_for_template(

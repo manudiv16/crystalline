@@ -1,4 +1,5 @@
 import gleam/option.{type Option, None}
+import sacrum_gleam/domain/project
 
 pub type Level {
   Epic
@@ -36,6 +37,7 @@ pub type Task {
   Task(
     id: String,
     short_id: String,
+    project_id: String,
     title: String,
     description: String,
     level: Level,
@@ -57,6 +59,7 @@ pub fn new_task(title: String, level: Level, priority: Priority) -> Task {
   Task(
     id: "",
     short_id: "",
+    project_id: project.default_project_id,
     title: title,
     description: "",
     level: level,

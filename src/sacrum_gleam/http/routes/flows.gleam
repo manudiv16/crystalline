@@ -9,15 +9,57 @@
 ///     PATCH  /api/v1/flow-templates/:id        update
 ///     DELETE /api/v1/flow-templates/:id        delete
 ///
+///   Transition sub-resource (issue #18):
+///     GET    /api/v1/flow-templates/:id/transitions                 list (200)
+///     POST   /api/v1/flow-templates/:id/transitions                 add (201; 409 duplicate id; 400 invalid DAG)
+///     DELETE /api/v1/flow-templates/:id/transitions/:transition_id  remove (200; 404 unknown; 400 breaks DAG)
+///
 ///   Instances:
 ///     POST   /api/v1/tasks/:task_id/flow       instantiate (201, status pending)
 ///     GET    /api/v1/tasks/:task_id/flow       instance + execution state
+///     DELETE /api/v1/tasks/:task_id/flow       unassign (200; 404 no instance; 409 active execution)
+///
+/// Unassign is allowed only for terminal executions (completed, rejected,
+/// failed, cancelled); pending, running and awaiting_input are refused. The
+/// validator has no reachability check, so transition edits may disconnect
+/// `initial_node_id` — a deliberate choice: disconnected nodes are a legal
+/// authoring state and running instances execute from their own snapshot.
 ///
 ///   Execution control:
 ///     POST   /api/v1/flows/:instance_id/advance   next engine step (Action)
 ///     POST   /api/v1/flows/:instance_id/complete  report step output (Action)
 ///     POST   /api/v1/flows/:instance_id/input     resume from awaiting_input (Action)
+///     POST   /api/v1/flows/:instance_id/reply     one human-input conversation turn (Action)
 ///     POST   /api/v1/flows/:instance_id/reject    mark execution rejected
+///     POST   /api/v1/flows/:instance_id/cancel    cancel a running execution
+///     GET    /api/v1/flows/:instance_id/conversation  the human turns, in order
+///
+/// ## Conversational human input (issue #21)
+///
+/// `reply` is the multi-turn counterpart of `input`: the client posts one
+/// human message and the server records the turn, feeds it through the same
+/// input path as `/input` and reports the resulting `{execution, action}`
+/// envelope, so a client loop never has to call `advance` itself. When the flow
+/// parks on another human node the returned action is `await_input` and the
+/// persisted status is `awaiting_input` — the same pairing `/advance` produces.
+///
+/// A turn is persisted on a step execution created for the gate node, using the
+/// session-log event types documented in `db/session_logs`
+/// ([`session_logs.prompt_event_type`] then
+/// [`session_logs.human_input_event_type`], sequences `n` and `n + 1`). Both
+/// appends go through `db/session_logs.append_log`, so the turn is published on
+/// the execution-event stream as `session_log` events keyed by the gate step
+/// execution id — the same write point `/executions/:id/logs` reads, no second
+/// history store and no second publish path.
+///
+/// The transcript is therefore readable three ways, all of them the same rows:
+/// `GET /api/v1/executions/:gate_step_id/logs` (paged by `before_sequence`, for
+/// one turn), `GET /api/v1/flows/:instance_id/conversation` (all gates of the
+/// instance in conversation order) and the `session_log` stream events.
+/// `conversation` exists because `/logs` is keyed by step execution id and a
+/// client driving a conversation would otherwise have to learn and track one
+/// step id per turn; it adds no storage, it only joins the same `session_logs`
+/// rows to their gate node.
 ///
 /// The pure flow engine (`flow/engine`, `flow/executor`) is stateless per
 /// request: the database owns the execution state, and each call hydrates a
@@ -32,17 +74,21 @@ import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some, unwrap}
 import gleam/result
+import gleam/string
 import sacrum_gleam/db/connection.{type DbConnection, type DbError}
 import sacrum_gleam/db/executions
 import sacrum_gleam/db/flows
+import sacrum_gleam/db/session_logs
 import sacrum_gleam/db/tasks
 import sacrum_gleam/domain/execution.{
   type ExecutionState, AwaitingInput, Cancelled, Completed, ExecutionState,
   Failed, Pending, Rejected, Running, StepCompleted, StepExecution,
-  execution_status_to_string, new_execution_state,
+  StepInProgress, execution_status_to_string, new_execution_state,
+  with_lifecycle,
 }
 import sacrum_gleam/domain/flow.{
-  type FlowInstance, type FlowTemplate, FlowInstance, FlowTemplate,
+  type FlowInstance, type FlowTemplate, type Transition, FlowInstance,
+  FlowTemplate,
 }
 import sacrum_gleam/flow/executor.{
   type Action, AwaitInput, ExecutionError, FlowComplete, FlowReject, RunParallel,
@@ -97,6 +143,9 @@ pub fn flow_routes(conn: DbConnection) -> List(Route) {
     Route(Get, "/api/v1/tasks/:task_id/flow", fn(req, params) {
       get_task_flow(req, params, conn)
     }),
+    Route(Delete, "/api/v1/tasks/:task_id/flow", fn(req, params) {
+      unassign_task_flow(req, params, conn)
+    }),
     // Execution control
     Route(Post, "/api/v1/flows/:instance_id/advance", fn(req, params) {
       advance(req, params, conn)
@@ -107,9 +156,30 @@ pub fn flow_routes(conn: DbConnection) -> List(Route) {
     Route(Post, "/api/v1/flows/:instance_id/input", fn(req, params) {
       input(req, params, conn)
     }),
+    Route(Post, "/api/v1/flows/:instance_id/reply", fn(req, params) {
+      reply(req, params, conn)
+    }),
+    Route(Get, "/api/v1/flows/:instance_id/conversation", fn(req, params) {
+      conversation(req, params, conn)
+    }),
     Route(Post, "/api/v1/flows/:instance_id/reject", fn(req, params) {
       reject(req, params, conn)
     }),
+    Route(Post, "/api/v1/flows/:instance_id/cancel", fn(req, params) {
+      cancel(req, params, conn)
+    }),
+    // ─── Issue #18: transition sub-resource ──────────────────────────────
+    Route(Get, "/api/v1/flow-templates/:id/transitions", fn(req, params) {
+      list_transitions(req, params, conn)
+    }),
+    Route(Post, "/api/v1/flow-templates/:id/transitions", fn(req, params) {
+      add_transition(req, params, conn)
+    }),
+    Route(
+      Delete,
+      "/api/v1/flow-templates/:id/transitions/:transition_id",
+      fn(req, params) { remove_transition(req, params, conn) },
+    ),
   ]
 }
 
@@ -186,7 +256,9 @@ fn delete_template(
     Error(Nil) -> helpers.error_response(400, "Missing template ID")
     Ok(id) ->
       case delete_template_service(conn, id) {
-        Error(message) -> helpers.error_response(409, message)
+        Error(NotFound(message)) -> helpers.error_response(404, message)
+        Error(Conflict(message)) -> helpers.error_response(409, message)
+        Error(error) -> execution_error_response(error)
         Ok(_) ->
           helpers.json_response(
             json.to_string(json.object([#("message", json.string("Deleted"))])),
@@ -256,6 +328,31 @@ fn get_task_flow(
             Ok([]) ->
               helpers.error_response(404, "No execution state for this task")
           }
+      }
+  }
+}
+
+// ─── Issue #18: unassign handler ──────────────────────────────────────────
+
+/// DELETE /api/v1/tasks/:task_id/flow — detach and delete a finished flow
+/// instance so the task can be bound to a fresh flow.
+fn unassign_task_flow(
+  _req: Request,
+  params: Dict(String, String),
+  conn: DbConnection,
+) -> Response {
+  case dict.get(params, "task_id") {
+    Error(Nil) -> helpers.error_response(400, "Missing task ID")
+    Ok(task_id) ->
+      case unassign_service(conn, task_id) {
+        Error(error) -> execution_error_response(error)
+        Ok(_) ->
+          helpers.json_response(
+            json.to_string(
+              json.object([#("message", json.string("Flow unassigned"))]),
+            ),
+            200,
+          )
       }
   }
 }
@@ -331,6 +428,63 @@ fn input(
   }
 }
 
+/// POST /api/v1/flows/:instance_id/reply — one conversational human turn.
+///
+/// `{"message": "..."}` must be non-blank; an invalid body is rejected before
+/// anything is loaded or written.
+fn reply(
+  req: Request,
+  params: Dict(String, String),
+  conn: DbConnection,
+) -> Response {
+  use body <- wisp.require_json(req)
+
+  case dict.get(params, "instance_id") {
+    Error(Nil) -> helpers.error_response(400, "Missing instance ID")
+    Ok(instance_id) ->
+      case decode_string_field(body, "message") {
+        Error(message) -> helpers.error_response(400, message)
+        Ok(message) ->
+          case string.trim(message) {
+            "" -> helpers.error_response(400, "Message must not be empty")
+            _ ->
+              case reply_service(conn, instance_id, message) {
+                Error(error) -> execution_error_response(error)
+                Ok(#(state, action)) ->
+                  helpers.json_response(
+                    json.to_string(execution_step_body(state, action)),
+                    200,
+                  )
+              }
+          }
+      }
+  }
+}
+
+/// GET /api/v1/flows/:instance_id/conversation — the instance's human turns.
+///
+/// Returns the `prompt`/`human_input` session logs of every gate step in
+/// conversation order. Reading the same rows through
+/// `/api/v1/executions/:step_id/logs` stays the paged, per-turn view.
+fn conversation(
+  _req: Request,
+  params: Dict(String, String),
+  conn: DbConnection,
+) -> Response {
+  case dict.get(params, "instance_id") {
+    Error(Nil) -> helpers.error_response(400, "Missing instance ID")
+    Ok(instance_id) ->
+      case conversation_service(conn, instance_id) {
+        Error(error) -> execution_error_response(error)
+        Ok(turns) ->
+          helpers.json_response(
+            json.to_string(json.array(turns, turn_log_body)),
+            200,
+          )
+      }
+  }
+}
+
 fn reject(
   _req: Request,
   params: Dict(String, String),
@@ -344,6 +498,84 @@ fn reject(
         Ok(state) ->
           helpers.json_response(
             json.to_string(execution_step_body(state, FlowReject)),
+            200,
+          )
+      }
+  }
+}
+
+fn cancel(
+  _req: Request,
+  params: Dict(String, String),
+  conn: DbConnection,
+) -> Response {
+  case dict.get(params, "instance_id") {
+    Error(Nil) -> helpers.error_response(400, "Missing instance ID")
+    Ok(instance_id) ->
+      case cancel_service(conn, instance_id) {
+        Error(error) -> execution_error_response(error)
+        Ok(state) ->
+          helpers.json_response(json.to_string(execution_body(state)), 200)
+      }
+  }
+}
+
+// ─── Issue #18: transition sub-resource handlers ─────────────────────────
+
+fn list_transitions(
+  _req: Request,
+  params: Dict(String, String),
+  conn: DbConnection,
+) -> Response {
+  case dict.get(params, "id") {
+    Error(Nil) -> helpers.error_response(400, "Missing template ID")
+    Ok(id) ->
+      case list_transitions_service(conn, id) {
+        Error(error) -> execution_error_response(error)
+        Ok(transitions) ->
+          helpers.json_response(
+            json.to_string(json.array(transitions, codec.transition_to_json)),
+            200,
+          )
+      }
+  }
+}
+
+fn add_transition(
+  req: Request,
+  params: Dict(String, String),
+  conn: DbConnection,
+) -> Response {
+  use body <- wisp.require_json(req)
+
+  case dict.get(params, "id") {
+    Error(Nil) -> helpers.error_response(400, "Missing template ID")
+    Ok(id) ->
+      case add_transition_service(conn, id, body) {
+        Error(error) -> execution_error_response(error)
+        Ok(transition) ->
+          helpers.json_response(
+            json.to_string(codec.transition_to_json(transition)),
+            201,
+          )
+      }
+  }
+}
+
+fn remove_transition(
+  _req: Request,
+  params: Dict(String, String),
+  conn: DbConnection,
+) -> Response {
+  case dict.get(params, "id"), dict.get(params, "transition_id") {
+    Error(Nil), _ -> helpers.error_response(400, "Missing template ID")
+    _, Error(Nil) -> helpers.error_response(400, "Missing transition ID")
+    Ok(id), Ok(transition_id) ->
+      case remove_transition_service(conn, id, transition_id) {
+        Error(error) -> execution_error_response(error)
+        Ok(_) ->
+          helpers.json_response(
+            json.to_string(json.object([#("message", json.string("Deleted"))])),
             200,
           )
       }
@@ -438,28 +670,172 @@ pub fn update_template_service(
 }
 
 /// Delete a template, rejecting when instances already reference it.
+///
+/// An unknown template id is `NotFound` (404); a template that still has
+/// instances is `Conflict` (409) with the surviving instance count.
 pub fn delete_template_service(
   conn: DbConnection,
   id: String,
-) -> Result(Nil, String) {
-  use _ <- result.try(
-    flows.get_flow_template(conn, id)
-    |> db_to_message
-    |> result.map(fn(_template) { Nil }),
-  )
+) -> Result(Nil, ExecutionError) {
+  use _ <- result.try(case flows.get_flow_template(conn, id) {
+    Ok(_template) -> Ok(Nil)
+    Error(_) -> Error(NotFound("Flow template not found: " <> id))
+  })
   use count <- result.try(
     flows.count_instances_for_template(conn, id)
-    |> db_to_message,
+    |> db_to_message
+    |> result.map_error(Internal),
   )
   case count > 0 {
     True ->
-      Error(
+      Error(Conflict(
         "Flow template is in use by " <> int.to_string(count) <> " instance(s)",
-      )
+      ))
     False ->
       flows.delete_flow_template(conn, id)
       |> db_to_message
+      |> result.map_error(Internal)
   }
+}
+
+// ─── Issue #18: transition and unassign services ─────────────────────────
+
+/// List the transitions stored on a template.
+pub fn list_transitions_service(
+  conn: DbConnection,
+  template_id: String,
+) -> Result(List(Transition), ExecutionError) {
+  case flows.get_flow_template(conn, template_id) {
+    Ok(template) -> Ok(template.transitions)
+    Error(_) -> Error(NotFound("Flow template not found: " <> template_id))
+  }
+}
+
+/// Add one transition to a template.
+///
+/// Transition edits re-run the template validator against the full candidate
+/// graph before anything is persisted. The validator intentionally has no
+/// reachability check: adding or removing the last transition out of
+/// `initial_node_id` is allowed, because disconnected nodes are a legal
+/// authoring state and running instances always use their own snapshot.
+pub fn add_transition_service(
+  conn: DbConnection,
+  template_id: String,
+  body: decode.Dynamic,
+) -> Result(Transition, ExecutionError) {
+  use template <- result.try(case flows.get_flow_template(conn, template_id) {
+    Ok(template) -> Ok(template)
+    Error(_) -> Error(NotFound("Flow template not found: " <> template_id))
+  })
+  use transition <- result.try(
+    decode.run(body, codec.transition_decoder())
+    |> result.map_error(fn(_errors) { BadRequest("Invalid transition body") }),
+  )
+
+  use _ <- result.try(
+    case
+      list.any(template.transitions, fn(stored) { stored.id == transition.id })
+    {
+      True -> Error(Conflict("Transition already exists: " <> transition.id))
+      False -> Ok(Nil)
+    },
+  )
+
+  let updated =
+    FlowTemplate(
+      ..template,
+      transitions: list.append(template.transitions, [transition]),
+    )
+  use _ <- result.try(
+    validate_template(updated)
+    |> result.map_error(BadRequest),
+  )
+  use persisted <- result.try(
+    flows.update_flow_template(conn, template_id, updated, milliseconds_now())
+    |> db_to_message
+    |> result.map_error(Internal),
+  )
+
+  case
+    list.find(persisted.transitions, fn(stored) { stored.id == transition.id })
+  {
+    Ok(stored) -> Ok(stored)
+    Error(Nil) -> Error(Internal("Persisted transition not found"))
+  }
+}
+
+/// Remove one transition from a template and re-validate the remaining graph.
+pub fn remove_transition_service(
+  conn: DbConnection,
+  template_id: String,
+  transition_id: String,
+) -> Result(Nil, ExecutionError) {
+  use template <- result.try(case flows.get_flow_template(conn, template_id) {
+    Ok(template) -> Ok(template)
+    Error(_) -> Error(NotFound("Flow template not found: " <> template_id))
+  })
+  use _ <- result.try(
+    case
+      list.any(template.transitions, fn(stored) { stored.id == transition_id })
+    {
+      False -> Error(NotFound("Transition not found: " <> transition_id))
+      True -> Ok(Nil)
+    },
+  )
+
+  let updated =
+    FlowTemplate(
+      ..template,
+      transitions: list.filter(template.transitions, fn(stored) {
+        stored.id != transition_id
+      }),
+    )
+  use _ <- result.try(
+    validate_template(updated)
+    |> result.map_error(BadRequest),
+  )
+  flows.update_flow_template(conn, template_id, updated, milliseconds_now())
+  |> db_to_message
+  |> result.map_error(Internal)
+  |> result.map(fn(_template) { Nil })
+}
+
+/// Unbind a task from its flow instance and delete that instance.
+///
+/// Unassign is allowed only for terminal executions (`completed`, `rejected`,
+/// `failed`, `cancelled`); `pending`, `running` and `awaiting_input` are
+/// refused with 409 because an active execution is not safe to remove.
+/// `pending` is refused too: the task is bound and work has not finished,
+/// even though the first advance has not happened yet.
+pub fn unassign_service(
+  conn: DbConnection,
+  task_id: String,
+) -> Result(Nil, ExecutionError) {
+  use instance <- result.try(case flows.get_instance_by_task(conn, task_id) {
+    Ok(instance) -> Ok(instance)
+    Error(_) -> Error(NotFound("No flow instance for this task"))
+  })
+  use state <- result.try(load_execution(conn, instance.id))
+
+  case state.status {
+    Completed | Rejected | Failed | Cancelled -> Ok(Nil)
+    Pending | Running | AwaitingInput ->
+      Error(Conflict(
+        "Cannot unassign flow: execution is "
+        <> execution_status_to_string(state.status),
+      ))
+  }
+  |> result.try(fn(_) {
+    let now = milliseconds_now()
+    use _ <- result.try(
+      tasks.clear_flow_binding(conn, task_id, now)
+      |> db_to_message
+      |> result.map_error(Internal),
+    )
+    flows.delete_flow_instance(conn, instance.id)
+    |> db_to_message
+    |> result.map_error(Internal)
+  })
 }
 
 // ─── Instance services ────────────────────────────────────────────────────
@@ -571,8 +947,8 @@ pub fn advance_service(
     }
   }
 
-  use _ <- result.try(persist_state(conn, new_state))
-  Ok(#(new_state, action))
+  use persisted <- result.try(persist_state(conn, new_state))
+  Ok(#(persisted, action))
 }
 
 /// Copy the persisted identity and runtime stores onto a freshly built state.
@@ -602,8 +978,7 @@ pub fn complete_service(
 
   use _ <- result.try(case state.status {
     Running -> Ok(Nil)
-    Pending ->
-      Error(Conflict("Execution has not started; call advance first"))
+    Pending -> Error(Conflict("Execution has not started; call advance first"))
     _ ->
       Error(Conflict(
         "Cannot complete: execution is "
@@ -643,11 +1018,18 @@ pub fn complete_service(
     executions.create_step_execution(conn, step, now)
     |> db_to_message,
   ))
-  use _ <- result.try(persist_state(conn, result.state))
-  Ok(#(result.state, result.action))
+  use persisted <- result.try(persist_state(conn, result.state))
+  Ok(#(persisted, result.action))
 }
 
 /// Resume an execution parked at `awaiting_input` with the supplied input.
+///
+/// The input walks the graph to its next actionable node: an agent step
+/// (`running`, `run_step`), another human gate (`awaiting_input`,
+/// `await_input` — the executor only flips that status in `advance`, so it is
+/// applied here too, otherwise the persisted row would claim `running` while
+/// the reported action waits for a human), or the end of the flow
+/// (`completed`, `flow_complete`).
 pub fn input_service(
   conn: DbConnection,
   instance_id: String,
@@ -666,9 +1048,127 @@ pub fn input_service(
   })
 
   let result = executor_provide_input(state, input_value)
+  let next_state = case result.action {
+    AwaitInput(_) -> ExecutionState(..result.state, status: AwaitingInput)
+    _ -> result.state
+  }
 
-  use _ <- result.try(persist_state(conn, result.state))
-  Ok(#(result.state, result.action))
+  use persisted <- result.try(persist_state(conn, next_state))
+  Ok(#(persisted, result.action))
+}
+
+/// Record and answer one human turn of an `awaiting_input` execution.
+///
+/// The turn is persisted before the engine is driven, and every write goes
+/// through the existing db functions, so a successful turn is durable even if
+/// the following transition reports an error, and the appends are published on
+/// the execution-event stream (`session_log` keyed by the gate step).
+///
+/// The turn's step execution is created with status `in_progress`: the gate is
+/// still the node the execution is parked on when the reply arrives, and
+/// `in_progress` keeps it out of `flow/executor.get_completed_children`, so
+/// recording a gate never changes which composite children the engine considers
+/// done.
+///
+/// The reply then follows exactly the `/input` path (`input_service`), so the
+/// resulting `{execution, action}` matches the single-shot API: `await_input`
+/// with `awaiting_input` when another human turn is needed, `run_step` when an
+/// agent step is next, `flow_complete` when the reply ends the flow.
+pub fn reply_service(
+  conn: DbConnection,
+  instance_id: String,
+  message: String,
+) -> Result(#(ExecutionState, Action), ExecutionError) {
+  use state <- result.try(load_execution(conn, instance_id))
+
+  use _ <- result.try(case state.status {
+    AwaitingInput -> Ok(Nil)
+    _ ->
+      Error(Conflict(
+        "Cannot reply: execution is "
+        <> execution_status_to_string(state.status),
+      ))
+  })
+
+  use node_id <- result.try(case state.current_node_id {
+    Some(id) -> Ok(id)
+    None -> Error(Conflict("Execution has no current node"))
+  })
+  use node <- result.try(case dict.get(state.flow_instance.nodes, node_id) {
+    Ok(node) -> Ok(node)
+    Error(Nil) ->
+      Error(Internal("Current node missing from the flow snapshot: " <> node_id))
+  })
+
+  let now = milliseconds_now()
+  let prompt = unwrap(node.prompt, node.goal)
+  let step =
+    StepExecution(
+      id: new_id("step"),
+      flow_instance_id: instance_id,
+      execution_state_id: state.id,
+      node_id: node_id,
+      task_id: state.task_id,
+      status: StepInProgress,
+      prompt: Some(prompt),
+      output: None,
+      transition_result: None,
+      model: None,
+      input_tokens: 0,
+      output_tokens: 0,
+      cost: 0.0,
+      duration_ms: 0,
+      session_id: None,
+      created_at: now,
+      completed_at: None,
+    )
+  use _ <- result.try(internal_error(
+    executions.create_step_execution(conn, step, now)
+    |> db_to_message,
+  ))
+  use _ <- result.try(internal_error(
+    session_logs.append_log(
+      conn,
+      step.id,
+      state.task_id,
+      session_logs.prompt_event_type,
+      prompt,
+      now,
+    )
+    |> db_to_message,
+  ))
+  use _ <- result.try(internal_error(
+    session_logs.append_log(
+      conn,
+      step.id,
+      state.task_id,
+      session_logs.human_input_event_type,
+      message,
+      now,
+    )
+    |> db_to_message,
+  ))
+
+  input_service(conn, instance_id, message)
+}
+
+/// Read an instance's human turns, in conversation order.
+///
+/// The instance must exist (404 otherwise) even when it has no turns yet, so a
+/// client can tell "nothing said yet" from "wrong id".
+pub fn conversation_service(
+  conn: DbConnection,
+  instance_id: String,
+) -> Result(List(session_logs.TurnLog), ExecutionError) {
+  use _ <- result.try(
+    case executions.get_execution_by_instance(conn, instance_id) {
+      Ok(_state) -> Ok(Nil)
+      Error(_) -> Error(NotFound("Flow instance not found: " <> instance_id))
+    },
+  )
+  session_logs.list_human_turns(conn, instance_id)
+  |> db_to_message
+  |> result.map_error(Internal)
 }
 
 /// Mark an execution as rejected.
@@ -690,7 +1190,35 @@ pub fn reject_service(
       status: Rejected,
       completed_at: Some(milliseconds_now()),
     )
-  use _ <- result.try(persist_state(conn, new_state))
+  use new_state <- result.try(persist_state(conn, new_state))
+  Ok(new_state)
+}
+
+/// Cancel a running or input-paused execution; pending and terminal states
+/// return a conflict naming their current status.
+pub fn cancel_service(
+  conn: DbConnection,
+  instance_id: String,
+) -> Result(ExecutionState, ExecutionError) {
+  use state <- result.try(load_execution(conn, instance_id))
+
+  use _ <- result.try(case state.status {
+    Running -> Ok(Nil)
+    AwaitingInput -> Ok(Nil)
+    _ ->
+      Error(Conflict(
+        "Cannot cancel: execution is "
+        <> execution_status_to_string(state.status),
+      ))
+  })
+
+  let new_state =
+    ExecutionState(
+      ..state,
+      status: Cancelled,
+      completed_at: Some(milliseconds_now()),
+    )
+  use new_state <- result.try(persist_state(conn, new_state))
   Ok(new_state)
 }
 
@@ -703,13 +1231,12 @@ fn load_execution(
   conn: DbConnection,
   instance_id: String,
 ) -> Result(ExecutionState, ExecutionError) {
-  use state <- result.try(case executions.get_execution_by_instance(
-    conn,
-    instance_id,
-  ) {
-    Ok(state) -> Ok(state)
-    Error(_) -> Error(NotFound("Flow instance not found: " <> instance_id))
-  })
+  use state <- result.try(
+    case executions.get_execution_by_instance(conn, instance_id) {
+      Ok(state) -> Ok(state)
+      Error(_) -> Error(NotFound("Flow instance not found: " <> instance_id))
+    },
+  )
   use steps <- result.try(internal_error(
     executions.get_steps_for_instance(conn, instance_id)
     |> db_to_message,
@@ -717,32 +1244,26 @@ fn load_execution(
   Ok(ExecutionState(..state, step_history: steps))
 }
 
-/// Persist status, current node, variables and loop counters after a step.
+/// Persist the normalized lifecycle, current node and mutable runtime state.
+/// Returns the state the row now reflects.
+///
+/// The pure executor has no clock, so it marks "started"/"completed" with a
+/// placeholder. `with_lifecycle` (shared with the daemon store so both writers
+/// agree) resolves the real timestamps: `started_at` is stamped on the first
+/// transition out of `pending` and kept from the loaded row afterwards,
+/// `completed_at` is stamped when the status becomes terminal and cleared
+/// while it is not.
 fn persist_state(
   conn: DbConnection,
   state: ExecutionState,
-) -> Result(Nil, ExecutionError) {
+) -> Result(ExecutionState, ExecutionError) {
+  let now = milliseconds_now()
+  let state = with_lifecycle(state, now)
   use _ <- result.try(internal_error(
-    executions.update_execution_status(
-      conn,
-      state.id,
-      state.status,
-      state.current_node_id,
-      milliseconds_now(),
-    )
+    executions.save_execution_state(conn, state, now)
     |> db_to_message,
   ))
-  use _ <- result.try(internal_error(
-    executions.update_execution_variables(
-      conn,
-      state.id,
-      state.variables,
-      state.loop_counters,
-      milliseconds_now(),
-    )
-    |> db_to_message,
-  ))
-  Ok(Nil)
+  Ok(state)
 }
 
 /// Map a string error produced by the db layer to an `Internal` error.
@@ -760,8 +1281,7 @@ fn transition_guard(
       Error(Conflict("Cannot " <> operation <> ": execution is completed"))
     Rejected ->
       Error(Conflict("Cannot " <> operation <> ": execution is rejected"))
-    Failed ->
-      Error(Conflict("Cannot " <> operation <> ": execution failed"))
+    Failed -> Error(Conflict("Cannot " <> operation <> ": execution failed"))
     Cancelled ->
       Error(Conflict("Cannot " <> operation <> ": execution was cancelled"))
     AwaitingInput ->
@@ -774,7 +1294,9 @@ fn transition_guard(
   }
 }
 
-/// Validate a template structure. Returns a human-readable message on error.
+/// Validate a template structure. Returns a human-readable message on error;
+/// it names the first `ValidationError` so API callers see the actual cause
+/// and not just a count.
 fn validate_template(template: FlowTemplate) -> Result(Nil, String) {
   case validator.validate(template) {
     Ok(Nil) -> Ok(Nil)
@@ -782,8 +1304,37 @@ fn validate_template(template: FlowTemplate) -> Result(Nil, String) {
       Error(
         "Invalid flow template ("
         <> int.to_string(list.length(errors))
-        <> " validation error(s))",
+        <> " validation error(s), first: "
+        <> first_validation_error(errors)
+        <> ")",
       )
+  }
+}
+
+fn first_validation_error(errors: List(validator.ValidationError)) -> String {
+  case errors {
+    [first, ..] -> validation_error_name(first)
+    [] -> "unknown validation error"
+  }
+}
+
+fn validation_error_name(error: validator.ValidationError) -> String {
+  case error {
+    validator.DuplicateNodeId(id) -> "duplicate node id: " <> id
+    validator.MissingInitialNode(id) -> "missing initial node: " <> id
+    validator.MissingChildRef(node_id, child_id) ->
+      "missing child ref: " <> node_id <> " -> " <> child_id
+    validator.MissingTransitionRef(transition_id, node_id) ->
+      "transition " <> transition_id <> " references unknown node: " <> node_id
+    validator.SelfTransition(node_id) ->
+      "self-transition: " <> node_id <> " -> " <> node_id
+    validator.CycleDetected(path) ->
+      "cycle detected: " <> string.join(path, " -> ")
+    validator.MissingBranchTarget(rule) ->
+      "branch rule targets unknown node: " <> rule.target_id
+    validator.StepMissingPrompt(node_id) -> "step missing prompt: " <> node_id
+    validator.CompositeNodeHasNoChildren(node_id) ->
+      "composite node has no children: " <> node_id
   }
 }
 
@@ -843,6 +1394,19 @@ fn execution_step_body(state: ExecutionState, action: Action) -> json.Json {
   json.object([
     #("execution", execution_body(state)),
     #("action", action_body(action)),
+  ])
+}
+
+/// One conversational turn row: the payload is plain text (the prompt asked or
+/// the message said), and `node_id` names the gate it belongs to.
+fn turn_log_body(turn: session_logs.TurnLog) -> json.Json {
+  json.object([
+    #("step_execution_id", json.string(turn.log.step_execution_id)),
+    #("node_id", json.string(turn.node_id)),
+    #("event_type", json.string(turn.log.event_type)),
+    #("payload", json.string(turn.log.payload)),
+    #("sequence", json.int(turn.log.sequence)),
+    #("created_at", json.int(turn.log.created_at)),
   ])
 }
 
