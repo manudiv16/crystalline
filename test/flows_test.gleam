@@ -301,6 +301,20 @@ fn assert_real_timestamp(value: Option(Int)) -> Int {
   stamp
 }
 
+/// Spin until the wall clock has moved past `instant` (milliseconds since the
+/// epoch), so the next persist is observably later.
+///
+/// A whole drive can otherwise finish inside one millisecond, in which case a
+/// regression that re-stamps `started_at` on every persist would store a value
+/// identical to the original: the equality assertion could not fail. The loop
+/// terminates as soon as the clock ticks (well under a millisecond).
+fn wait_past_clock(instant: Int) -> Nil {
+  case flows.milliseconds_now() > instant {
+    True -> Nil
+    False -> wait_past_clock(instant)
+  }
+}
+
 // ─── Acceptance tests ─────────────────────────────────────────────────────
 
 /// POST /api/v1/flow-templates returns the created template with status 201.
@@ -707,6 +721,10 @@ pub fn completion_persists_completed_at_and_keeps_started_at_test() {
     lifecycle_row(conn, instance_id)
   let started = assert_real_timestamp(after_advance_started)
   assert after_advance_completed == None
+  // Every later persist must happen at a strictly later clock instant, so a
+  // regression that re-stamps `started_at` cannot hide behind millisecond
+  // granularity.
+  wait_past_clock(started)
 
   // Complete step A: still running, so `started_at` must survive the persist
   // and `completed_at` must stay NULL.
@@ -717,6 +735,7 @@ pub fn completion_persists_completed_at_and_keeps_started_at_test() {
       json.object([#("output", json.string("step A done"))]),
     )
   assert lifecycle_row(conn, instance_id) == #("running", Some(started), None)
+  wait_past_clock(started)
 
   // Complete step B: terminal, so `completed_at` is stamped.
   let resp =
@@ -734,8 +753,10 @@ pub fn completion_persists_completed_at_and_keeps_started_at_test() {
   let #(row_status, row_started, row_completed) =
     lifecycle_row(conn, instance_id)
   assert row_status == "completed"
-  assert row_started == Some(started)
   let completed = assert_real_timestamp(row_completed)
+  // Byte-identical to the value persisted by the first advance.
+  assert row_started == Some(started)
+  assert completed >= started
   assert reported_started == Some(started)
   assert reported_completed == Some(completed)
 }
@@ -756,6 +777,7 @@ pub fn cancel_persists_completed_at_and_keeps_started_at_test() {
     )
   let #(_, after_advance_started, _) = lifecycle_row(conn, instance_id)
   let started = assert_real_timestamp(after_advance_started)
+  wait_past_clock(started)
 
   let resp =
     post_json(
@@ -773,6 +795,83 @@ pub fn cancel_persists_completed_at_and_keeps_started_at_test() {
   assert row_status == "cancelled"
   assert row_started == Some(started)
   let completed = assert_real_timestamp(row_completed)
+  assert completed >= started
+  assert reported_started == Some(started)
+  assert reported_completed == Some(completed)
+}
+
+/// The `input` resume path (running → awaiting_input → running → completed)
+/// must also keep the original `started_at` byte-identical, with
+/// `completed_at` stamped only once the flow terminates.
+pub fn input_preserves_started_at_until_completion_test() {
+  let conn = new_conn()
+  let resp =
+    post_json(conn, "/api/v1/flow-templates", gated_template("Gated lifecycle"))
+  let assert 201 = status(resp)
+  let assert Ok(template_id) = json.parse(body(resp), string_field("id"))
+  let task_id = create_task(conn, "Gated lifecycle task")
+  let instance_id = instantiate(conn, task_id, template_id)
+
+  // Advance past the initial step and capture the persisted start instant.
+  let _ =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/advance",
+      json.object([]),
+    )
+  let #(_, after_advance_started, _) = lifecycle_row(conn, instance_id)
+  let started = assert_real_timestamp(after_advance_started)
+  wait_past_clock(started)
+
+  // Completing step A parks the execution on the human-input node.
+  let _ =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/complete",
+      json.object([#("output", json.string("step A done"))]),
+    )
+  assert lifecycle_row(conn, instance_id) == #("running", Some(started), None)
+
+  let _ =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/advance",
+      json.object([]),
+    )
+  assert lifecycle_row(conn, instance_id)
+    == #("awaiting_input", Some(started), None)
+  wait_past_clock(started)
+
+  // Resuming with input keeps the same start instant.
+  let resp =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/input",
+      json.object([#("input", json.string("approved"))]),
+    )
+  assert status(resp) == 200
+  assert lifecycle_row(conn, instance_id) == #("running", Some(started), None)
+  wait_past_clock(started)
+
+  // The terminal transition stamps `completed_at` at or after `started_at`.
+  let resp =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/complete",
+      json.object([#("output", json.string("step B done"))]),
+    )
+  assert status(resp) == 200
+  let assert Ok(reported_started) =
+    json.parse(body(resp), execution_started_at())
+  let assert Ok(reported_completed) =
+    json.parse(body(resp), execution_completed_at())
+
+  let #(row_status, row_started, row_completed) =
+    lifecycle_row(conn, instance_id)
+  assert row_status == "completed"
+  let completed = assert_real_timestamp(row_completed)
+  assert row_started == Some(started)
+  assert completed >= started
   assert reported_started == Some(started)
   assert reported_completed == Some(completed)
 }
@@ -792,6 +891,7 @@ pub fn reject_persists_completed_at_test() {
     )
   let #(_, after_advance_started, _) = lifecycle_row(conn, instance_id)
   let started = assert_real_timestamp(after_advance_started)
+  wait_past_clock(started)
 
   let resp =
     post_json(
@@ -808,5 +908,6 @@ pub fn reject_persists_completed_at_test() {
   assert row_status == "rejected"
   assert row_started == Some(started)
   let completed = assert_real_timestamp(row_completed)
+  assert completed >= started
   assert reported_completed == Some(completed)
 }
