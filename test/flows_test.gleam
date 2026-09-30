@@ -100,6 +100,30 @@ fn execution_status() -> decode.Decoder(String) {
   field_decoder("execution", string_field("status"))
 }
 
+fn execution_started_at() -> decode.Decoder(Option(Int)) {
+  field_decoder(
+    "execution",
+    field_decoder("started_at", decode.optional(decode.int)),
+  )
+}
+
+fn execution_completed_at() -> decode.Decoder(Option(Int)) {
+  field_decoder(
+    "execution",
+    field_decoder("completed_at", decode.optional(decode.int)),
+  )
+}
+
+// `POST /cancel` answers with the bare execution object rather than the
+// `{execution, action}` envelope.
+fn body_started_at() -> decode.Decoder(Option(Int)) {
+  field_decoder("started_at", decode.optional(decode.int))
+}
+
+fn body_completed_at() -> decode.Decoder(Option(Int)) {
+  field_decoder("completed_at", decode.optional(decode.int))
+}
+
 fn instance_id_of() -> decode.Decoder(String) {
   field_decoder("instance", string_field("id"))
 }
@@ -239,6 +263,42 @@ fn instantiate(
   let assert 201 = status(resp)
   let assert Ok(instance_id) = json.parse(body(resp), instance_id_of())
   instance_id
+}
+
+// ─── Persisted lifecycle helpers ──────────────────────────────────────────
+
+/// Read the lifecycle columns straight from `execution_states` — the ground
+/// truth the HTTP responses must agree with. `None` is a SQL NULL, so the
+/// assertions fail if a timestamp the response reported was never written.
+fn lifecycle_row(
+  conn: connection.DbConnection,
+  instance_id: String,
+) -> #(String, Option(Int), Option(Int)) {
+  let assert Ok(rows) =
+    connection.query(
+      conn,
+      "SELECT status, started_at, completed_at FROM execution_states "
+        <> "WHERE flow_instance_id = ?",
+      [connection.TextVal(instance_id)],
+    )
+  let assert [[connection.TextVal(row_status), started, completed], ..] = rows
+  #(row_status, int_option_value(started), int_option_value(completed))
+}
+
+fn int_option_value(value: connection.Value) -> Option(Int) {
+  case value {
+    connection.IntVal(v) -> Some(v)
+    _ -> None
+  }
+}
+
+/// Milliseconds since the epoch are far above any placeholder a pure engine
+/// could fabricate (the executor marks state with `0`), so this rejects a row
+/// that stored the sentinel instead of the clock.
+fn assert_real_timestamp(value: Option(Int)) -> Int {
+  let assert Some(stamp) = value
+  assert stamp > 1_000_000_000_000
+  stamp
 }
 
 // ─── Acceptance tests ─────────────────────────────────────────────────────
@@ -583,4 +643,170 @@ pub fn get_task_flow_reflects_current_state_test() {
   assert status(resp) == 200
   assert string.contains(body(resp), instance_id)
   assert string.contains(body(resp), "\"status\":\"pending\"")
+}
+
+// ─── Persisted lifecycle: the response must agree with the row ────────────
+
+/// Starting a pending execution stamps `started_at` (a real clock value, not
+/// the engine's placeholder) and leaves `completed_at` NULL; the response
+/// reports the persisted value and reads round-trip it.
+pub fn advance_persists_started_at_test() {
+  let conn = new_conn()
+  let template_id = create_template(conn, "Lifecycle starter")
+  let task_id = create_task(conn, "Lifecycle start task")
+  let instance_id = instantiate(conn, task_id, template_id)
+
+  // A pending execution carries no lifecycle timestamps.
+  assert lifecycle_row(conn, instance_id) == #("pending", None, None)
+
+  let resp =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/advance",
+      json.object([]),
+    )
+  assert status(resp) == 200
+  let assert Ok(reported_started) =
+    json.parse(body(resp), execution_started_at())
+  let assert Ok(reported_completed) =
+    json.parse(body(resp), execution_completed_at())
+  assert reported_completed == None
+
+  let #(row_status, row_started, row_completed) =
+    lifecycle_row(conn, instance_id)
+  assert row_status == "running"
+  assert row_completed == None
+  let started = assert_real_timestamp(row_started)
+  // The response must not report a timestamp that was never persisted.
+  assert reported_started == Some(started)
+
+  // Reads round-trip the persisted value.
+  let flow_resp = get(conn, "/api/v1/tasks/" <> task_id <> "/flow")
+  assert status(flow_resp) == 200
+  let assert Ok(fetched_started) =
+    json.parse(body(flow_resp), execution_started_at())
+  assert fetched_started == Some(started)
+}
+
+/// Reaching the terminal status stamps `completed_at` and keeps the original
+/// `started_at` across the intermediate persists (a later persist must not
+/// null it out); the final response agrees with the row.
+pub fn completion_persists_completed_at_and_keeps_started_at_test() {
+  let conn = new_conn()
+  let template_id = create_template(conn, "Lifecycle completer")
+  let task_id = create_task(conn, "Lifecycle complete task")
+  let instance_id = instantiate(conn, task_id, template_id)
+
+  let _ =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/advance",
+      json.object([]),
+    )
+  let #(_, after_advance_started, after_advance_completed) =
+    lifecycle_row(conn, instance_id)
+  let started = assert_real_timestamp(after_advance_started)
+  assert after_advance_completed == None
+
+  // Complete step A: still running, so `started_at` must survive the persist
+  // and `completed_at` must stay NULL.
+  let _ =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/complete",
+      json.object([#("output", json.string("step A done"))]),
+    )
+  assert lifecycle_row(conn, instance_id) == #("running", Some(started), None)
+
+  // Complete step B: terminal, so `completed_at` is stamped.
+  let resp =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/complete",
+      json.object([#("output", json.string("step B done"))]),
+    )
+  assert status(resp) == 200
+  let assert Ok(reported_started) =
+    json.parse(body(resp), execution_started_at())
+  let assert Ok(reported_completed) =
+    json.parse(body(resp), execution_completed_at())
+
+  let #(row_status, row_started, row_completed) =
+    lifecycle_row(conn, instance_id)
+  assert row_status == "completed"
+  assert row_started == Some(started)
+  let completed = assert_real_timestamp(row_completed)
+  assert reported_started == Some(started)
+  assert reported_completed == Some(completed)
+}
+
+/// Cancelling a running execution stamps `completed_at`, preserves the
+/// original `started_at`, and the response agrees with the row.
+pub fn cancel_persists_completed_at_and_keeps_started_at_test() {
+  let conn = new_conn()
+  let template_id = create_template(conn, "Lifecycle cancellable")
+  let task_id = create_task(conn, "Lifecycle cancel task")
+  let instance_id = instantiate(conn, task_id, template_id)
+
+  let _ =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/advance",
+      json.object([]),
+    )
+  let #(_, after_advance_started, _) = lifecycle_row(conn, instance_id)
+  let started = assert_real_timestamp(after_advance_started)
+
+  let resp =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/cancel",
+      json.object([]),
+    )
+  assert status(resp) == 200
+  let assert Ok(reported_started) = json.parse(body(resp), body_started_at())
+  let assert Ok(reported_completed) =
+    json.parse(body(resp), body_completed_at())
+
+  let #(row_status, row_started, row_completed) =
+    lifecycle_row(conn, instance_id)
+  assert row_status == "cancelled"
+  assert row_started == Some(started)
+  let completed = assert_real_timestamp(row_completed)
+  assert reported_started == Some(started)
+  assert reported_completed == Some(completed)
+}
+
+/// Rejecting an execution stamps `completed_at` and keeps `started_at`.
+pub fn reject_persists_completed_at_test() {
+  let conn = new_conn()
+  let template_id = create_template(conn, "Lifecycle rejectable")
+  let task_id = create_task(conn, "Lifecycle reject task")
+  let instance_id = instantiate(conn, task_id, template_id)
+
+  let _ =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/advance",
+      json.object([]),
+    )
+  let #(_, after_advance_started, _) = lifecycle_row(conn, instance_id)
+  let started = assert_real_timestamp(after_advance_started)
+
+  let resp =
+    post_json(
+      conn,
+      "/api/v1/flows/" <> instance_id <> "/reject",
+      json.object([]),
+    )
+  assert status(resp) == 200
+  let assert Ok(reported_completed) =
+    json.parse(body(resp), execution_completed_at())
+
+  let #(row_status, row_started, row_completed) =
+    lifecycle_row(conn, instance_id)
+  assert row_status == "rejected"
+  assert row_started == Some(started)
+  let completed = assert_real_timestamp(row_completed)
+  assert reported_completed == Some(completed)
 }

@@ -265,11 +265,13 @@ fn db_store() -> runtime.Store {
   runtime.Store(
     save_status: fn(conn, state, now) {
       use _ <- result.try(
-        db_result(executions.update_execution_status(
+        db_result(executions.update_execution_lifecycle(
           conn,
           state.id,
           state.status,
           state.current_node_id,
+          state.started_at,
+          state.completed_at,
           now,
         )),
       )

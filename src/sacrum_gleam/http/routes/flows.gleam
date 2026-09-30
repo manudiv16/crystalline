@@ -38,9 +38,9 @@ import sacrum_gleam/db/executions
 import sacrum_gleam/db/flows
 import sacrum_gleam/db/tasks
 import sacrum_gleam/domain/execution.{
-  type ExecutionState, AwaitingInput, Cancelled, Completed, ExecutionState,
-  Failed, Pending, Rejected, Running, StepCompleted, StepExecution,
-  execution_status_to_string, new_execution_state,
+  type ExecutionState, type ExecutionStatus, AwaitingInput, Cancelled, Completed,
+  ExecutionState, Failed, Pending, Rejected, Running, StepCompleted,
+  StepExecution, execution_status_to_string, new_execution_state,
 }
 import sacrum_gleam/domain/flow.{
   type FlowInstance, type FlowTemplate, FlowInstance, FlowTemplate,
@@ -591,8 +591,8 @@ pub fn advance_service(
     }
   }
 
-  use _ <- result.try(persist_state(conn, new_state))
-  Ok(#(new_state, action))
+  use persisted <- result.try(persist_state(conn, new_state))
+  Ok(#(persisted, action))
 }
 
 /// Copy the persisted identity and runtime stores onto a freshly built state.
@@ -662,8 +662,8 @@ pub fn complete_service(
     executions.create_step_execution(conn, step, now)
     |> db_to_message,
   ))
-  use _ <- result.try(persist_state(conn, result.state))
-  Ok(#(result.state, result.action))
+  use persisted <- result.try(persist_state(conn, result.state))
+  Ok(#(persisted, result.action))
 }
 
 /// Resume an execution parked at `awaiting_input` with the supplied input.
@@ -686,8 +686,8 @@ pub fn input_service(
 
   let result = executor_provide_input(state, input_value)
 
-  use _ <- result.try(persist_state(conn, result.state))
-  Ok(#(result.state, result.action))
+  use persisted <- result.try(persist_state(conn, result.state))
+  Ok(#(persisted, result.action))
 }
 
 /// Mark an execution as rejected.
@@ -709,7 +709,7 @@ pub fn reject_service(
       status: Rejected,
       completed_at: Some(milliseconds_now()),
     )
-  use _ <- result.try(persist_state(conn, new_state))
+  use new_state <- result.try(persist_state(conn, new_state))
   Ok(new_state)
 }
 
@@ -737,7 +737,7 @@ pub fn cancel_service(
       status: Cancelled,
       completed_at: Some(milliseconds_now()),
     )
-  use _ <- result.try(persist_state(conn, new_state))
+  use new_state <- result.try(persist_state(conn, new_state))
   Ok(new_state)
 }
 
@@ -763,18 +763,29 @@ fn load_execution(
   Ok(ExecutionState(..state, step_history: steps))
 }
 
-/// Persist status, current node, variables and loop counters after a step.
+/// Persist status, current node, lifecycle timestamps, variables and loop
+/// counters after a step. Returns the state the row now reflects.
+///
+/// The pure executor has no clock, so it marks "started"/"completed" with a
+/// placeholder. The route layer owns the clock and resolves the real
+/// timestamps here: `started_at` is stamped on the first transition out of
+/// `pending` and kept from the loaded row afterwards, `completed_at` is
+/// stamped when the status becomes terminal and cleared while it is not.
 fn persist_state(
   conn: DbConnection,
   state: ExecutionState,
-) -> Result(Nil, ExecutionError) {
+) -> Result(ExecutionState, ExecutionError) {
+  let now = milliseconds_now()
+  let state = with_lifecycle(state, now)
   use _ <- result.try(internal_error(
-    executions.update_execution_status(
+    executions.update_execution_lifecycle(
       conn,
       state.id,
       state.status,
       state.current_node_id,
-      milliseconds_now(),
+      state.started_at,
+      state.completed_at,
+      now,
     )
     |> db_to_message,
   ))
@@ -784,11 +795,45 @@ fn persist_state(
       state.id,
       state.variables,
       state.loop_counters,
-      milliseconds_now(),
+      now,
     )
     |> db_to_message,
   ))
-  Ok(Nil)
+  Ok(state)
+}
+
+/// Resolve the lifecycle timestamps the persisted row (and therefore the
+/// response body) must carry for `state`. Zero is the engine's placeholder for
+/// "stamp now"; a loaded row always carries a real millisecond value.
+fn with_lifecycle(state: ExecutionState, now: Int) -> ExecutionState {
+  let started_at = case state.status {
+    Pending -> None
+    _ ->
+      case state.started_at {
+        Some(started) if started > 0 -> Some(started)
+        _ -> Some(now)
+      }
+  }
+
+  let completed_at = case is_terminal(state.status) {
+    False -> None
+    True ->
+      case state.completed_at {
+        Some(completed) if completed > 0 -> Some(completed)
+        _ -> Some(now)
+      }
+  }
+
+  ExecutionState(..state, started_at: started_at, completed_at: completed_at)
+}
+
+/// Terminal statuses freeze the execution: no further transition is allowed
+/// and `completed_at` is meaningful.
+fn is_terminal(status: ExecutionStatus) -> Bool {
+  case status {
+    Completed | Rejected | Cancelled | Failed -> True
+    Pending | Running | AwaitingInput -> False
+  }
 }
 
 /// Map a string error produced by the db layer to an `Internal` error.

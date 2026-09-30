@@ -188,6 +188,39 @@ pub fn update_execution_status(
   connection.execute(conn, sql, params)
 }
 
+/// Persist the full execution lifecycle in one write: status, current node and
+/// the start/completion timestamps.
+///
+/// `started_at` must carry the value the row should hold once the execution
+/// has left `pending`; callers that hydrate from the database must pass the
+/// loaded value back so a later write never clears it. `completed_at` is
+/// `None` while the execution is not terminal.
+pub fn update_execution_lifecycle(
+  conn: DbConnection,
+  id: String,
+  status: ExecutionStatus,
+  current_node_id: Option(String),
+  started_at: Option(Int),
+  completed_at: Option(Int),
+  now: Int,
+) -> Result(Nil, DbError) {
+  let sql = {
+    "UPDATE execution_states SET status = ?, current_node_id = ?, "
+    <> "started_at = ?, completed_at = ?, updated_at = ? WHERE id = ?"
+  }
+
+  let params = [
+    connection.TextVal(execution_status_to_string(status)),
+    option_to_text(current_node_id),
+    int_option_to_val(started_at),
+    int_option_to_val(completed_at),
+    connection.IntVal(now),
+    connection.TextVal(id),
+  ]
+
+  connection.execute(conn, sql, params)
+}
+
 pub fn update_execution_variables(
   conn: DbConnection,
   id: String,
