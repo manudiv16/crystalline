@@ -1,5 +1,5 @@
 import gleam/dict.{type Dict}
-import gleam/option.{type Option, None}
+import gleam/option.{type Option, None, Some}
 import sacrum_gleam/domain/flow.{type FlowInstance}
 
 /// Execution state for a FlowInstance running against a Task.
@@ -98,6 +98,44 @@ pub fn new_execution_state(
     started_at: None,
     completed_at: None,
   )
+}
+
+/// Whether an execution status represents a finished lifecycle.
+pub fn is_terminal(status: ExecutionStatus) -> Bool {
+  case status {
+    Completed -> True
+    Rejected -> True
+    Failed -> True
+    Cancelled -> True
+    Pending -> False
+    Running -> False
+    AwaitingInput -> False
+  }
+}
+
+/// Normalize persisted lifecycle timestamps using the same rules for every writer.
+///
+/// Pending executions have not started. Active executions retain a valid start
+/// time or receive `now`; terminal executions likewise retain a valid completion
+/// time or receive `now`. Non-terminal executions never have a completion time.
+pub fn with_lifecycle(state: ExecutionState, now: Int) -> ExecutionState {
+  let started_at = case state.status {
+    Pending -> None
+    _ ->
+      case state.started_at {
+        Some(timestamp) if timestamp > 0 -> Some(timestamp)
+        _ -> Some(now)
+      }
+  }
+  let completed_at = case is_terminal(state.status) {
+    True ->
+      case state.completed_at {
+        Some(timestamp) if timestamp > 0 -> Some(timestamp)
+        _ -> Some(now)
+      }
+    False -> None
+  }
+  ExecutionState(..state, started_at: started_at, completed_at: completed_at)
 }
 
 pub fn step_status_to_string(s: StepStatus) -> String {

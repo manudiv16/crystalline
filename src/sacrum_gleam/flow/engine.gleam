@@ -64,6 +64,15 @@ pub fn register_template(
   Ok(Engine(..engine, templates: TemplateRegistry(templates)))
 }
 
+/// Restore a template snapshot that has already passed persistence-time validation.
+///
+/// Unlike `register_template`, this does not re-run authoring validation; it is
+/// for rehydrating database-backed executions after process restart.
+pub fn restore_template(engine: Engine, template: FlowTemplate) -> Engine {
+  let templates = dict.insert(engine.templates.templates, template.id, template)
+  Engine(..engine, templates: TemplateRegistry(templates))
+}
+
 pub fn get_template(
   engine: Engine,
   id: String,

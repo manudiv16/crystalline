@@ -39,7 +39,7 @@ import sacrum_gleam/db/tasks
 import sacrum_gleam/domain/execution.{
   type ExecutionState, AwaitingInput, Cancelled, Completed, ExecutionState,
   Failed, Pending, Rejected, Running, StepCompleted, StepExecution,
-  execution_status_to_string, new_execution_state,
+  execution_status_to_string, new_execution_state, with_lifecycle,
 }
 import sacrum_gleam/domain/flow.{
   type FlowInstance, type FlowTemplate, FlowInstance, FlowTemplate,
@@ -602,8 +602,7 @@ pub fn complete_service(
 
   use _ <- result.try(case state.status {
     Running -> Ok(Nil)
-    Pending ->
-      Error(Conflict("Execution has not started; call advance first"))
+    Pending -> Error(Conflict("Execution has not started; call advance first"))
     _ ->
       Error(Conflict(
         "Cannot complete: execution is "
@@ -703,13 +702,12 @@ fn load_execution(
   conn: DbConnection,
   instance_id: String,
 ) -> Result(ExecutionState, ExecutionError) {
-  use state <- result.try(case executions.get_execution_by_instance(
-    conn,
-    instance_id,
-  ) {
-    Ok(state) -> Ok(state)
-    Error(_) -> Error(NotFound("Flow instance not found: " <> instance_id))
-  })
+  use state <- result.try(
+    case executions.get_execution_by_instance(conn, instance_id) {
+      Ok(state) -> Ok(state)
+      Error(_) -> Error(NotFound("Flow instance not found: " <> instance_id))
+    },
+  )
   use steps <- result.try(internal_error(
     executions.get_steps_for_instance(conn, instance_id)
     |> db_to_message,
@@ -717,32 +715,16 @@ fn load_execution(
   Ok(ExecutionState(..state, step_history: steps))
 }
 
-/// Persist status, current node, variables and loop counters after a step.
+/// Persist the normalized lifecycle, current node and mutable runtime state.
 fn persist_state(
   conn: DbConnection,
   state: ExecutionState,
 ) -> Result(Nil, ExecutionError) {
-  use _ <- result.try(internal_error(
-    executions.update_execution_status(
-      conn,
-      state.id,
-      state.status,
-      state.current_node_id,
-      milliseconds_now(),
-    )
+  let now = milliseconds_now()
+  internal_error(
+    executions.save_execution_state(conn, with_lifecycle(state, now), now)
     |> db_to_message,
-  ))
-  use _ <- result.try(internal_error(
-    executions.update_execution_variables(
-      conn,
-      state.id,
-      state.variables,
-      state.loop_counters,
-      milliseconds_now(),
-    )
-    |> db_to_message,
-  ))
-  Ok(Nil)
+  )
 }
 
 /// Map a string error produced by the db layer to an `Internal` error.
@@ -760,8 +742,7 @@ fn transition_guard(
       Error(Conflict("Cannot " <> operation <> ": execution is completed"))
     Rejected ->
       Error(Conflict("Cannot " <> operation <> ": execution is rejected"))
-    Failed ->
-      Error(Conflict("Cannot " <> operation <> ": execution failed"))
+    Failed -> Error(Conflict("Cannot " <> operation <> ": execution failed"))
     Cancelled ->
       Error(Conflict("Cannot " <> operation <> ": execution was cancelled"))
     AwaitingInput ->

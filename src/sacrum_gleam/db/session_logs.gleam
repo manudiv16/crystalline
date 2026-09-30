@@ -151,6 +151,26 @@ pub fn list_logs(
   Ok(list.reverse(logs))
 }
 
+/// Whether any step in a flow instance already has a durable error event.
+pub fn has_error_log_for_instance(
+  conn: DbConnection,
+  flow_instance_id: String,
+) -> Result(Bool, DbError) {
+  use row <- result.try(
+    connection.query_one(
+      conn,
+      "SELECT COUNT(*) FROM session_logs sl "
+        <> "JOIN step_executions se ON se.id = sl.step_execution_id "
+        <> "WHERE se.flow_instance_id = ? AND sl.event_type = 'error'",
+      [connection.TextVal(flow_instance_id)],
+    ),
+  )
+  case row {
+    [connection.IntVal(count), ..] -> Ok(count > 0)
+    _ -> Error(connection.QueryError("Could not count execution error logs"))
+  }
+}
+
 /// Delete every log event belonging to a step execution.
 pub fn delete_logs_for_execution(
   conn: DbConnection,
