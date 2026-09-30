@@ -125,6 +125,17 @@ let flow = crystalline.build_linear_flow(
 )
 ```
 
+## Task hierarchy and flow cancellation
+
+`GET /api/v1/tasks/:id/path` returns a `path` array ordered from the root task
+through the requested task. Missing task IDs return 404; malformed cyclic or
+excessively deep parent chains return 500 rather than looping indefinitely.
+
+`POST /api/v1/flows/:instance_id/cancel` cancels executions in `running` or
+`awaiting_input` and returns the updated execution. Pending and terminal states
+return 409 with the current status; unknown instances return 404. A cancelled
+execution cannot be advanced.
+
 ## Status
 
 Scaffolded: domain model, flow engine and database layer are written. The build is being

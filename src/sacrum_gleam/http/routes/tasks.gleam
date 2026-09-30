@@ -1,3 +1,4 @@
+/// Task CRUD, dependency, and hierarchy-path HTTP endpoints.
 import gleam/dict.{type Dict}
 import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
@@ -24,6 +25,9 @@ pub fn task_routes(conn: DbConnection) -> List(Route) {
     Route(Get, "/api/v1/tasks", fn(req, _) { list_tasks(req, conn) }),
     Route(Get, "/api/v1/tasks/:id", fn(req, params) {
       get_task(req, params, conn)
+    }),
+    Route(Get, "/api/v1/tasks/:id/path", fn(req, params) {
+      get_task_path(req, params, conn)
     }),
     Route(Patch, "/api/v1/tasks/:id", fn(req, params) {
       update_task(req, params, conn)
@@ -186,6 +190,34 @@ fn get_task(
         Ok(t) -> helpers.json_response(json.to_string(task_to_json(t)), 200)
       }
     }
+  }
+}
+
+// ─── GET /api/v1/tasks/:id/path ───────────────────────────────────────────
+
+fn get_task_path(
+  _req: Request,
+  params: Dict(String, String),
+  conn: DbConnection,
+) -> Response {
+  case dict.get(params, "id") {
+    Error(_) -> helpers.error_response(400, "Missing task ID")
+    Ok(id) ->
+      case tasks.get_task_path(conn, id) {
+        Error(tasks.TaskPathNotFound) ->
+          helpers.error_response(404, "Task not found")
+        Error(tasks.TaskPathCycle) ->
+          helpers.error_response(500, "Cycle detected in task parent_id path")
+        Error(tasks.TaskPathTooDeep) ->
+          helpers.error_response(500, "Task hierarchy exceeds maximum depth")
+        Error(tasks.TaskPathDatabaseError(_)) ->
+          helpers.error_response(500, "Failed to load task hierarchy")
+        Ok(path) -> {
+          let response_json =
+            json.object([#("path", json.array(path, task_to_json))])
+          helpers.json_response(json.to_string(response_json), 200)
+        }
+      }
   }
 }
 

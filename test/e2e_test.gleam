@@ -305,6 +305,19 @@ fn runtime_db_error(error: connection.DbError) -> runtime.RuntimeError {
   runtime.PersistenceFailure(connection.error_to_string(error))
 }
 
+fn persisted_execution_status(
+  conn: connection.DbConnection,
+  instance_id: String,
+) -> String {
+  let assert Ok([[connection.TextVal(status), ..], ..]) =
+    connection.query(
+      conn,
+      "SELECT status FROM execution_states WHERE flow_instance_id = ?",
+      [connection.TextVal(instance_id)],
+    )
+  status
+}
+
 /// Rehydrate the route-created execution into the pure flow engine so the
 /// runtime harness drives that same persisted instance, not a test-only flow.
 fn runtime_engine(
@@ -540,4 +553,85 @@ pub fn design_implement_human_input_logs_and_archive_test() {
   let assert Ok(archived_task) = db_tasks.get_task(conn, task_id)
   assert archived_task.archived
   assert archived_task.status == task.Done
+}
+
+pub fn cancel_running_execution_blocks_advance_test() {
+  let conn = new_conn()
+  seed_templates(conn)
+  let task_id = create_task(conn, "Cancel running execution")
+  let instance_id = instantiate_flow(conn, task_id, "design_implement")
+
+  let started = post(conn, "/api/v1/flows/" <> instance_id <> "/advance")
+  assert status(started) == 200
+  let #(started_status, _started_action) = execution_action(started)
+  assert started_status == "running"
+
+  let cancelled = post(conn, "/api/v1/flows/" <> instance_id <> "/cancel")
+  assert status(cancelled) == 200
+  let assert Ok(cancelled_status) =
+    json.parse(body(cancelled), string_field("status"))
+  assert cancelled_status == "cancelled"
+  assert persisted_execution_status(conn, instance_id) == "cancelled"
+
+  let advanced = post(conn, "/api/v1/flows/" <> instance_id <> "/advance")
+  assert status(advanced) == 409
+  assert string.contains(body(advanced), "was cancelled")
+
+  let cancelled_again = post(conn, "/api/v1/flows/" <> instance_id <> "/cancel")
+  assert status(cancelled_again) == 409
+  assert string.contains(body(cancelled_again), "cancelled")
+}
+
+pub fn cancel_awaiting_input_execution_test() {
+  let conn = new_conn()
+  seed_templates(conn)
+  let task_id = create_task(conn, "Cancel input-paused execution")
+  let instance_id = instantiate_flow(conn, task_id, "design_implement")
+
+  let started = post(conn, "/api/v1/flows/" <> instance_id <> "/advance")
+  assert status(started) == 200
+  let assert Ok(runtime_state) =
+    runtime.run_until_wait(conn, runtime_engine(conn, instance_id), instance_id)
+  assert runtime_state.status == AwaitingInput
+
+  let cancelled = post(conn, "/api/v1/flows/" <> instance_id <> "/cancel")
+  assert status(cancelled) == 200
+  let assert Ok(cancelled_status) =
+    json.parse(body(cancelled), string_field("status"))
+  assert cancelled_status == "cancelled"
+  assert persisted_execution_status(conn, instance_id) == "cancelled"
+}
+
+pub fn cancel_unknown_pending_and_completed_executions_test() {
+  let conn = new_conn()
+  seed_templates(conn)
+
+  let unknown = post(conn, "/api/v1/flows/missing-instance/cancel")
+  assert status(unknown) == 404
+
+  let pending_task = create_task(conn, "Pending execution")
+  let pending_id = instantiate_flow(conn, pending_task, "design_implement")
+  let pending = post(conn, "/api/v1/flows/" <> pending_id <> "/cancel")
+  assert status(pending) == 409
+  assert string.contains(body(pending), "pending")
+
+  let completed_task = create_task(conn, "Completed execution")
+  let completed_id = instantiate_flow(conn, completed_task, "implement_review")
+  let started = post(conn, "/api/v1/flows/" <> completed_id <> "/advance")
+  assert status(started) == 200
+  let #(started_status, started_action) = execution_action(started)
+  let #(final_status, final_action) =
+    complete_until_flow_complete(
+      conn,
+      completed_id,
+      started_status,
+      started_action,
+      12,
+    )
+  assert final_status == "completed"
+  assert final_action == "flow_complete"
+
+  let completed = post(conn, "/api/v1/flows/" <> completed_id <> "/cancel")
+  assert status(completed) == 409
+  assert string.contains(body(completed), "completed")
 }

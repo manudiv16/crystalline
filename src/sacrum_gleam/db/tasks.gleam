@@ -39,6 +39,18 @@ pub type TaskUpdates {
   )
 }
 
+/// Errors returned while walking a task's parent hierarchy.
+pub type TaskPathError {
+  /// The requested task does not exist.
+  TaskPathNotFound
+  /// A parent link revisits a task already in the path.
+  TaskPathCycle
+  /// The hierarchy exceeds the maximum supported number of tasks.
+  TaskPathTooDeep
+  /// A database query failed while loading a parent task.
+  TaskPathDatabaseError(DbError)
+}
+
 pub fn default_filter() -> TaskFilter {
   TaskFilter(
     level: None,
@@ -138,6 +150,54 @@ pub fn get_task(conn: DbConnection, id: String) -> Result(Task, DbError) {
   let statement = "SELECT " <> columns_sql() <> " FROM tasks WHERE id = ?"
   use row <- result.try(connection.query_one(conn, statement, [TextVal(id)]))
   row_to_task(row)
+}
+
+/// Return the requested task's ancestor chain in root-to-task order.
+///
+/// The walk rejects cycles and bounds the hierarchy depth so malformed
+/// `parent_id` data cannot cause an unbounded traversal.
+pub fn get_task_path(
+  conn: DbConnection,
+  id: String,
+) -> Result(List(Task), TaskPathError) {
+  case get_task(conn, id) {
+    Error(_) -> Error(TaskPathNotFound)
+    Ok(task) -> walk_task_path(conn, task, [task], [task.id], 1)
+  }
+}
+
+const max_task_path_length = 1000
+
+fn walk_task_path(
+  conn: DbConnection,
+  current: Task,
+  path: List(Task),
+  visited: List(String),
+  depth: Int,
+) -> Result(List(Task), TaskPathError) {
+  case current.parent_id {
+    None -> Ok(path)
+    Some(parent_id) ->
+      case list.contains(visited, parent_id) {
+        True -> Error(TaskPathCycle)
+        False ->
+          case depth >= max_task_path_length {
+            True -> Error(TaskPathTooDeep)
+            False ->
+              case get_task(conn, parent_id) {
+                Error(error) -> Error(TaskPathDatabaseError(error))
+                Ok(parent) ->
+                  walk_task_path(
+                    conn,
+                    parent,
+                    [parent, ..path],
+                    [parent.id, ..visited],
+                    depth + 1,
+                  )
+              }
+          }
+      }
+  }
 }
 
 /// Return whether a task with the given ID exists (including archived tasks).

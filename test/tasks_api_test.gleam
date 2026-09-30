@@ -1,4 +1,4 @@
-/// C6 acceptance tests for the Tasks API.
+/// C6 acceptance tests for the Tasks API, including hierarchy path reads.
 ///
 /// Exercises the HTTP routes end-to-end against an in-memory libsql database
 /// using `wisp/simulate` requests. Each test gets a fresh connection so the
@@ -15,6 +15,7 @@ import sacrum_gleam/db/migrations
 import sacrum_gleam/domain/task
 import sacrum_gleam/http/router
 import sacrum_gleam/http/routes/tasks as tasks_routes
+import sacrum_gleam/http/server
 import wisp
 import wisp/simulate as sim
 
@@ -32,7 +33,7 @@ fn new_conn() -> connection.DbConnection {
 }
 
 fn task_routes(conn: connection.DbConnection) -> List(router.Route) {
-  tasks_routes.task_routes(conn)
+  server.all_routes(conn, "local")
 }
 
 fn get(conn: connection.DbConnection, path: String) -> wisp.Response {
@@ -79,6 +80,11 @@ fn string_field(key: String) -> decode.Decoder(String) {
     use value <- decode.field(key, decode.string)
     decode.success(value)
   }
+}
+
+fn task_path_ids() -> decode.Decoder(List(String)) {
+  use ids <- decode.field("path", decode.list(string_field("id")))
+  decode.success(ids)
 }
 
 fn task_json(
@@ -354,4 +360,66 @@ pub fn delete_with_cascade_archives_all_descendants_test() {
 
   // Parent + child + grandchild are all archived.
   assert archived_count(conn) == 3
+}
+
+pub fn task_path_returns_root_first_chain_test() {
+  let conn = new_conn()
+  let epic = create_task(conn, "Epic", "epic", "high", None)
+  let ticket = create_task(conn, "Ticket", "ticket", "medium", Some(epic))
+  let task = create_task(conn, "Task", "task", "low", Some(ticket))
+
+  let response = get(conn, "/api/v1/tasks/" <> task <> "/path")
+  assert status(response) == 200
+  let assert Ok(ids) = json.parse(body(response), task_path_ids())
+  assert ids == [epic, ticket, task]
+}
+
+pub fn task_path_returns_only_root_for_root_task_test() {
+  let conn = new_conn()
+  let root = create_task(conn, "Root", "epic", "high", None)
+
+  let response = get(conn, "/api/v1/tasks/" <> root <> "/path")
+  assert status(response) == 200
+  let assert Ok(ids) = json.parse(body(response), task_path_ids())
+  assert ids == [root]
+}
+
+pub fn task_paths_for_siblings_are_independent_test() {
+  let conn = new_conn()
+  let parent = create_task(conn, "Shared parent", "epic", "high", None)
+  let first = create_task(conn, "First child", "ticket", "medium", Some(parent))
+  let second =
+    create_task(conn, "Second child", "ticket", "medium", Some(parent))
+
+  let first_response = get(conn, "/api/v1/tasks/" <> first <> "/path")
+  assert status(first_response) == 200
+  let assert Ok(first_path) = json.parse(body(first_response), task_path_ids())
+  assert first_path == [parent, first]
+
+  let second_response = get(conn, "/api/v1/tasks/" <> second <> "/path")
+  assert status(second_response) == 200
+  let assert Ok(second_path) =
+    json.parse(body(second_response), task_path_ids())
+  assert second_path == [parent, second]
+}
+
+pub fn task_path_returns_not_found_for_unknown_id_test() {
+  let conn = new_conn()
+
+  let response = get(conn, "/api/v1/tasks/missing-task/path")
+  assert status(response) == 404
+  assert string.contains(body(response), "Task not found")
+}
+
+pub fn task_path_rejects_parent_cycles_test() {
+  let conn = new_conn()
+  let task = create_task(conn, "Cyclic task", "task", "medium", None)
+  let assert Ok(_) =
+    connection.execute(conn, "UPDATE tasks SET parent_id = id WHERE id = ?", [
+      connection.TextVal(task),
+    ])
+
+  let response = get(conn, "/api/v1/tasks/" <> task <> "/path")
+  assert status(response) == 500
+  assert string.contains(body(response), "Cycle detected")
 }

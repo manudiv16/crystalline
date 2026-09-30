@@ -18,6 +18,7 @@
 ///     POST   /api/v1/flows/:instance_id/complete  report step output (Action)
 ///     POST   /api/v1/flows/:instance_id/input     resume from awaiting_input (Action)
 ///     POST   /api/v1/flows/:instance_id/reject    mark execution rejected
+///     POST   /api/v1/flows/:instance_id/cancel    cancel a running execution
 ///
 /// The pure flow engine (`flow/engine`, `flow/executor`) is stateless per
 /// request: the database owns the execution state, and each call hydrates a
@@ -109,6 +110,9 @@ pub fn flow_routes(conn: DbConnection) -> List(Route) {
     }),
     Route(Post, "/api/v1/flows/:instance_id/reject", fn(req, params) {
       reject(req, params, conn)
+    }),
+    Route(Post, "/api/v1/flows/:instance_id/cancel", fn(req, params) {
+      cancel(req, params, conn)
     }),
   ]
 }
@@ -346,6 +350,22 @@ fn reject(
             json.to_string(execution_step_body(state, FlowReject)),
             200,
           )
+      }
+  }
+}
+
+fn cancel(
+  _req: Request,
+  params: Dict(String, String),
+  conn: DbConnection,
+) -> Response {
+  case dict.get(params, "instance_id") {
+    Error(Nil) -> helpers.error_response(400, "Missing instance ID")
+    Ok(instance_id) ->
+      case cancel_service(conn, instance_id) {
+        Error(error) -> execution_error_response(error)
+        Ok(state) ->
+          helpers.json_response(json.to_string(execution_body(state)), 200)
       }
   }
 }
@@ -602,8 +622,7 @@ pub fn complete_service(
 
   use _ <- result.try(case state.status {
     Running -> Ok(Nil)
-    Pending ->
-      Error(Conflict("Execution has not started; call advance first"))
+    Pending -> Error(Conflict("Execution has not started; call advance first"))
     _ ->
       Error(Conflict(
         "Cannot complete: execution is "
@@ -694,6 +713,34 @@ pub fn reject_service(
   Ok(new_state)
 }
 
+/// Cancel a running or input-paused execution; pending and terminal states
+/// return a conflict naming their current status.
+pub fn cancel_service(
+  conn: DbConnection,
+  instance_id: String,
+) -> Result(ExecutionState, ExecutionError) {
+  use state <- result.try(load_execution(conn, instance_id))
+
+  use _ <- result.try(case state.status {
+    Running -> Ok(Nil)
+    AwaitingInput -> Ok(Nil)
+    _ ->
+      Error(Conflict(
+        "Cannot cancel: execution is "
+        <> execution_status_to_string(state.status),
+      ))
+  })
+
+  let new_state =
+    ExecutionState(
+      ..state,
+      status: Cancelled,
+      completed_at: Some(milliseconds_now()),
+    )
+  use _ <- result.try(persist_state(conn, new_state))
+  Ok(new_state)
+}
+
 // ─── Persistence helpers ──────────────────────────────────────────────────
 
 /// Load an execution state from the database (by flow instance id),
@@ -703,13 +750,12 @@ fn load_execution(
   conn: DbConnection,
   instance_id: String,
 ) -> Result(ExecutionState, ExecutionError) {
-  use state <- result.try(case executions.get_execution_by_instance(
-    conn,
-    instance_id,
-  ) {
-    Ok(state) -> Ok(state)
-    Error(_) -> Error(NotFound("Flow instance not found: " <> instance_id))
-  })
+  use state <- result.try(
+    case executions.get_execution_by_instance(conn, instance_id) {
+      Ok(state) -> Ok(state)
+      Error(_) -> Error(NotFound("Flow instance not found: " <> instance_id))
+    },
+  )
   use steps <- result.try(internal_error(
     executions.get_steps_for_instance(conn, instance_id)
     |> db_to_message,
@@ -760,8 +806,7 @@ fn transition_guard(
       Error(Conflict("Cannot " <> operation <> ": execution is completed"))
     Rejected ->
       Error(Conflict("Cannot " <> operation <> ": execution is rejected"))
-    Failed ->
-      Error(Conflict("Cannot " <> operation <> ": execution failed"))
+    Failed -> Error(Conflict("Cannot " <> operation <> ": execution failed"))
     Cancelled ->
       Error(Conflict("Cannot " <> operation <> ": execution was cancelled"))
     AwaitingInput ->
