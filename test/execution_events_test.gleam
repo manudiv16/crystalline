@@ -50,6 +50,7 @@ fn insert_task(conn: DbConnection, id: String, now: Int) -> Nil {
     Task(
       id: id,
       short_id: "short-" <> id,
+      project_id: "default",
       title: "Task " <> id,
       description: "",
       level: Ticket,
